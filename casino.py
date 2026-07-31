@@ -8,6 +8,8 @@ PySpigot Casino - ДИНАМИЧЕСКИЙ ДЖЕКПОТ И ПРИЯТНЫЕ З
   /casino history — Последние ставки казино
   /jackpot, /casinobank — Просмотреть текущий банк джекпота
   /jackpot history — Последние победители джекпота
+  /jackpot add <сумма> — Добавить деньги в банк (администратор)
+  /jackpot remove <сумма> — Убрать деньги из банка (администратор)
   /opjackpot [сумма] — Тестовый 100% ДЖЕКПОТ (Только для /op)
 ===============================================================================
 """
@@ -102,7 +104,7 @@ def get_script_dir():
 # -----------------------------------------------------------------------------
 class CasinoConfig:
     PLUGIN_NAME = u"SmartY-Casino"
-    VERSION = u"2.5.0"
+    VERSION = u"2.6.0"
 
     MIN_CASINO_BET = 10.0
     BASE_JACKPOT = 1000.0
@@ -118,6 +120,7 @@ class CasinoConfig:
     # "следующий джекпот только при достижении банка от 20000$".
     JACKPOT_MIN_BANK_TO_WIN = 20000.0
     JACKPOT_FIXED_CHANCE = 0.0005  # 0.05% на спин, ТОЛЬКО когда банк >= порога
+    MAX_JACKPOT_BANK = 10000000000000000.0
 
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
@@ -136,6 +139,11 @@ class CasinoConfig:
         "casino_jackpot_broadcast": u"&6&l\u2605 [\u041a\u0410\u0417\u0418\u041d\u041e] &e\u0418\u0433\u0440\u043e\u043a &f{player} &e\u0441\u043e\u0440\u0432\u0430\u043b &6\u0414\u0416\u0415\u041a\u041f\u041e\u0422 &a{formatted_amount}&e!&r",
         "casino_balance_after": u"{prefix}&7\u0412\u0430\u0448 \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u0431\u0430\u043b\u0430\u043d\u0441: &e{formatted_balance}",
         "jackpot_info": u"{prefix}&7\u0422\u0435\u043a\u0443\u0449\u0438\u0439 \u043d\u0430\u043a\u043e\u043f\u043b\u0435\u043d\u043d\u044b\u0439 \u0434\u0436\u0435\u043a\u043f\u043e\u0442: &e{formatted_amount}",
+        "jackpot_admin_usage": u"{prefix}&cИспользование: &f/jackpot <add|remove> <сумма>",
+        "jackpot_admin_added": u"{prefix}&aВ банк джекпота добавлено &e{formatted_amount}&a. Новый банк: &e{formatted_bank}",
+        "jackpot_admin_removed": u"{prefix}&aИз банка джекпота убрано &e{formatted_amount}&a. Новый банк: &e{formatted_bank}",
+        "jackpot_admin_too_large": u"{prefix}&cПосле операции банк не может превышать &e{formatted_limit}&c!",
+        "jackpot_admin_unavailable": u"{prefix}&cЭкономика сейчас недоступна, банк не изменён.",
         "jackpot_title": u"&6\u2605 \u0414\u0416\u0415\u041a\u041f\u041e\u0422 \u2605",
         "jackpot_subtitle": u"&7\u0418\u0433\u0440\u043e\u043a &f{player} &7\u0437\u0430\u0431\u0440\u0430\u043b &a{formatted_amount}&7!",
         "invalid_amount": u"{prefix}&c\u0423\u043a\u0430\u0436\u0438\u0442\u0435 \u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u0443\u044e \u0441\u0433\u043c\u043c\u0443!",
@@ -446,7 +454,8 @@ def _normalize_history_entry(raw, jackpot_entry=False):
         "multiplier": round(max(0.0, _safe_float(raw.get("multiplier", 0.0), 0.0)), 2),
         "outcome": outcome,
         "attempt": max(1, _safe_nonnegative_int(raw.get("attempt", 1), 1)),
-        "timestamp": max(0, _safe_nonnegative_int(raw.get("timestamp", 0), 0))
+        "timestamp": max(0, _safe_nonnegative_int(raw.get("timestamp", 0), 0)),
+        "forced": bool(raw.get("forced", False))
     }
 
 
@@ -582,6 +591,28 @@ def record_casino_result(player_uuid, player_name, bet, outcome, multiplier, pay
     return attempt
 
 
+def record_forced_jackpot(player_uuid, player_name, bet, payout):
+    """Записывает /opjackpot только в историю джекпотов, не меняя счётчик реальных ставок."""
+    attempt = _safe_nonnegative_int(casino_history_state.get("attempt_since_jackpot", 0), 0) + 1
+    entry = _normalize_history_entry({
+        "player_uuid": player_uuid or u"",
+        "player_name": player_name,
+        "bet": bet,
+        "payout": payout,
+        "multiplier": 50.0,
+        "outcome": "JACKPOT",
+        "attempt": attempt,
+        "timestamp": int(time.time()),
+        "forced": True
+    }, True)
+
+    jackpots = casino_history_state.setdefault("jackpots", [])
+    jackpots.append(entry)
+    casino_history_state["jackpots"] = jackpots[-CasinoConfig.HISTORY_LIMIT:]
+    save_casino_history()
+    return attempt
+
+
 class CasinoAccountManager(object):
     """Менеджер счетов казино, работающий напрямую через общий EconomyManager."""
     def __init__(self):
@@ -620,6 +651,21 @@ class CasinoAccountManager(object):
         if eco:
             eco.add_to_jackpot(amount)
             self.jackpot_bank = _safe_float(eco.jackpot_bank, default=self.jackpot_bank)
+
+    def adjust_jackpot(self, amount_delta):
+        """Корректирует общий банк с сохранением через EconomyManager и ограничением снизу нулём."""
+        eco = get_economy_manager()
+        if not eco:
+            return False, self.jackpot_bank, self.jackpot_bank
+
+        old_bank = max(0.0, _safe_float(eco.jackpot_bank, default=0.0))
+        delta = _safe_float(amount_delta, default=0.0)
+        new_bank = round(max(0.0, old_bank + delta), 2)
+        if new_bank != new_bank or new_bank == float("inf"):
+            return False, old_bank, old_bank
+        eco.add_to_jackpot(new_bank - old_bank)
+        self.jackpot_bank = max(0.0, _safe_float(eco.jackpot_bank, default=old_bank))
+        return True, old_bank, self.jackpot_bank
 
     def claim_jackpot(self, bet):
         """ПРИ ПОБЕДЕ: ВЫПЛАТА = СТАВКАИГРОКА + ВЕСЬ НАКОПЛЕННЫЙ БАНК ДЖЕКПОТА!"""
@@ -836,12 +882,21 @@ def _make_history_head(entry, history_kind):
 
     if history_kind == "jackpot":
         display_name = u"&6&l★ &f" + player_name
-        lore = [
-            u"&7Забрал джекпот: &a" + format_currency(payout),
-            u"&7Ставка: &e" + format_currency(bet),
-            u"&7Джекпот выпал с попытки: &f#" + str(attempt),
-            u"&8" + _format_history_time(entry.get("timestamp", 0))
-        ]
+        if entry.get("forced", False):
+            lore = [
+                u"&7Забрал джекпот: &a" + format_currency(payout),
+                u"&7Ставка: &e" + format_currency(bet),
+                u"&dАдминский /opjackpot",
+                u"&7Попытка: &fне учитывается",
+                u"&8" + _format_history_time(entry.get("timestamp", 0))
+            ]
+        else:
+            lore = [
+                u"&7Забрал джекпот: &a" + format_currency(payout),
+                u"&7Ставка: &e" + format_currency(bet),
+                u"&7Джекпот выпал с попытки: &f#" + str(attempt),
+                u"&8" + _format_history_time(entry.get("timestamp", 0))
+            ]
     else:
         outcome = to_unicode(entry.get("outcome", u"LOSE")).upper()
         if outcome == u"JACKPOT":
@@ -971,10 +1026,12 @@ def finish_casino_game(player, bet, outcome, multiplier, payout, final_symbols, 
         if player_online:
             send_casino_msg(player, "casino_jackpot_win", formatted_amount=format_currency(payout))
 
-    # reset_bank=False используется исключительно тестовым /opjackpot: он не
-    # является реальной оплаченной ставкой и не влияет на историю/номер попытки.
+    # /opjackpot показывается среди джекпотов, но не является оплаченной ставкой,
+    # не попадает в /casino history и не сбрасывает счётчик реальных попыток.
     if reset_bank:
         record_casino_result(player_uuid, player_name, bet, outcome, multiplier, payout)
+    elif outcome == "JACKPOT":
+        record_forced_jackpot(player_uuid, player_name, bet, payout)
 
     # Вывод ТОЧНОГО обновленного баланса после игры
     if player_online:
@@ -1193,16 +1250,85 @@ def cmd_casino(*args):
     return True
 
 
+def is_jackpot_admin(sender):
+    """Разрешает управление банком консоли, OP и администраторам экономики."""
+    if sender is None or not hasattr(sender, "getUniqueId"):
+        return True
+    if hasattr(sender, "isOp") and sender.isOp():
+        return True
+    if hasattr(sender, "hasPermission"):
+        return bool(
+            sender.hasPermission("pyspigot.economy.admin")
+            or sender.hasPermission("economy.admin")
+            or sender.hasPermission("pyspigot.casino.admin")
+        )
+    return False
+
+
 def cmd_jackpot(*args):
     """
-    Просмотр банка джекпота для всех игроков.
+    Просмотр банка/истории для всех игроков и управление банком для администраторов.
     """
     sender, cmd_args = parse_cmd_args(*args)
-    if len(cmd_args) >= 1 and to_unicode(cmd_args[0]).lower() == u"history":
+    subcommand = to_unicode(cmd_args[0]).lower() if cmd_args else u""
+
+    if subcommand == u"history":
         open_casino_history_gui(sender, "jackpot")
         return True
 
     manager = CasinoAccountManager()
+
+    if subcommand in (u"add", u"remove"):
+        if not is_jackpot_admin(sender):
+            send_casino_msg(sender, "no_permission")
+            return True
+        if len(cmd_args) < 2:
+            send_casino_msg(sender, "jackpot_admin_usage")
+            return True
+
+        try:
+            amount = round(float(cmd_args[1]), 2)
+        except (ValueError, TypeError, OverflowError):
+            send_casino_msg(sender, "invalid_amount")
+            return True
+
+        if amount != amount or amount in (float("inf"), float("-inf")) or amount <= 0.0:
+            send_casino_msg(sender, "invalid_amount")
+            return True
+        if amount > CasinoConfig.MAX_JACKPOT_BANK:
+            send_casino_msg(sender, "jackpot_admin_too_large", formatted_limit=format_currency(CasinoConfig.MAX_JACKPOT_BANK))
+            return True
+
+        current_bank = max(0.0, _safe_float(manager.jackpot_bank, default=0.0))
+        if subcommand == u"add" and current_bank + amount > CasinoConfig.MAX_JACKPOT_BANK:
+            send_casino_msg(sender, "jackpot_admin_too_large", formatted_limit=format_currency(CasinoConfig.MAX_JACKPOT_BANK))
+            return True
+
+        delta = amount if subcommand == u"add" else -amount
+        changed, old_bank, new_bank = manager.adjust_jackpot(delta)
+        if not changed:
+            send_casino_msg(sender, "jackpot_admin_unavailable")
+            return True
+
+        actual_amount = abs(round(new_bank - old_bank, 2))
+        message_key = "jackpot_admin_added" if subcommand == u"add" else "jackpot_admin_removed"
+        send_casino_msg(
+            sender,
+            message_key,
+            formatted_amount=format_currency(actual_amount),
+            formatted_bank=format_currency(new_bank)
+        )
+        _, admin_name = get_sender_uuid_and_name(sender)
+        log_info(u"{0} used /jackpot {1} {2}: {3} -> {4}".format(
+            admin_name, subcommand, format_currency(amount), format_currency(old_bank), format_currency(new_bank)
+        ))
+        return True
+
+    if subcommand:
+        send_casino_msg(sender, "jackpot_admin_usage" if is_jackpot_admin(sender) else "jackpot_info",
+                        formatted_amount=format_currency(manager.jackpot_bank))
+        return True
+
     send_casino_msg(sender, "jackpot_info", formatted_amount=format_currency(manager.jackpot_bank))
     return True
 
@@ -1222,8 +1348,12 @@ def cmd_opjackpot(*args):
     if len(cmd_args) >= 1:
         try:
             bet = float(cmd_args[0])
-        except ValueError:
-            bet = 100.0
+        except (ValueError, TypeError, OverflowError):
+            send_casino_msg(sender, "invalid_amount")
+            return True
+        if bet != bet or bet in (float("inf"), float("-inf")) or bet <= 0.0:
+            send_casino_msg(sender, "invalid_amount")
+            return True
 
     start_slot_animation(sender, bet, force_jackpot=True, reset_bank=False)
     return True
@@ -1261,7 +1391,15 @@ def tab_jackpot(*args):
     cmd_args = get_cmd_args_from_args(args)
     if len(cmd_args) <= 1:
         prefix = cmd_args[0].lower() if len(cmd_args) == 1 else ""
-        return build_java_list([u"history"] if u"history".startswith(prefix) else [])
+        options = [u"history"]
+        sender = args[0] if args else None
+        if is_jackpot_admin(sender):
+            options.extend([u"add", u"remove"])
+        return build_java_list([option for option in options if option.startswith(prefix)])
+    if len(cmd_args) == 2 and cmd_args[0].lower() in (u"add", u"remove"):
+        prefix = cmd_args[1]
+        amounts = [u"100", u"1000", u"5000", u"10000", u"20000"]
+        return build_java_list([amount for amount in amounts if amount.startswith(prefix)])
     return build_java_list([])
 
 
@@ -1520,7 +1658,7 @@ def unregister_casino_commands():
 def register_casino_commands():
     commands_def = [
         ("casino", "Play casino slot machine", "/casino <bet>", [], cmd_casino, tab_casino),
-        ("jackpot", "Check casino jackpot pool", "/jackpot [history]", ["casinobank"], cmd_jackpot, tab_jackpot),
+        ("jackpot", "Check or manage casino jackpot pool", "/jackpot [history|add|remove] [amount]", ["casinobank"], cmd_jackpot, tab_jackpot),
         ("opjackpot", "OP test 100% jackpot spin", "/opjackpot [bet]", ["adminjackpot", "jackpotwin"], cmd_opjackpot, tab_opjackpot),
     ]
 
