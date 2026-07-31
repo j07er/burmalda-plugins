@@ -791,10 +791,12 @@ def get_pyspigot_plugin():
 class CasinoHistoryHolder(InventoryHolder):
     def __init__(self, history_kind):
         self.history_kind = history_kind
-        self.inventory = None
+        # Имя `inventory` зарезервировано Jython как read-only JavaBean-свойство
+        # интерфейса InventoryHolder из-за метода getInventory().
+        self._history_inventory = None
 
     def getInventory(self):
-        return self.inventory
+        return self._history_inventory
 
 
 def _format_history_time(timestamp):
@@ -888,7 +890,7 @@ def open_casino_history_gui(sender, history_kind):
 
     holder = CasinoHistoryHolder(history_kind)
     inventory = Bukkit.createInventory(holder, 9, to_java_string(colorize(title)))
-    holder.inventory = inventory
+    holder._history_inventory = inventory
 
     for slot, entry in enumerate(reversed(records)):
         inventory.setItem(slot, _make_history_head(entry, history_kind))
