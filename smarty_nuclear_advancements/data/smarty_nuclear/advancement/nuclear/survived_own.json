@@ -1,0 +1,28 @@
+{
+  "parent": "smarty_nuclear:nuclear/dropped",
+  "display": {
+    "icon": {
+      "id": "minecraft:elytra"
+    },
+    "title": {
+      "text": "Оппенгеймер",
+      "color": "dark_purple"
+    },
+    "description": {
+      "text": "Переживи взрыв собственной боеголовки за пределами смертельной зоны",
+      "color": "gray"
+    },
+    "frame": "challenge",
+    "show_toast": true,
+    "announce_to_chat": false,
+    "hidden": false
+  },
+  "criteria": {
+    "grant": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "rewards": {
+    "experience": 1000
+  }
+}

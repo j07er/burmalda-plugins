@@ -1,0 +1,24 @@
+{
+  "display": {
+    "icon": {
+      "id": "minecraft:nether_star"
+    },
+    "title": {
+      "text": "Гонка вооружения"
+    },
+    "description": {
+      "text": "Овладей энергией, способной изменить мир",
+      "color": "gray"
+    },
+    "background": "minecraft:block/magma",
+    "frame": "task",
+    "show_toast": false,
+    "announce_to_chat": false,
+    "hidden": false
+  },
+  "criteria": {
+    "grant": {
+      "trigger": "minecraft:impossible"
+    }
+  }
+}

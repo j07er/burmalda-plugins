@@ -1,0 +1,27 @@
+{
+  "parent": "smarty_nuclear:nuclear/root",
+  "display": {
+    "icon": {
+      "id": "minecraft:lodestone"
+    },
+    "title": {
+      "text": "Теперь я стал Смертью"
+    },
+    "description": {
+      "text": "Впервые создай термоядерную боеголовку «Солнцепёк»",
+      "color": "gray"
+    },
+    "frame": "task",
+    "show_toast": true,
+    "announce_to_chat": false,
+    "hidden": false
+  },
+  "criteria": {
+    "grant": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "rewards": {
+    "experience": 100
+  }
+}

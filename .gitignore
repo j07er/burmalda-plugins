@@ -1,0 +1,19 @@
+.DS_Store
+.stfolder/
+.idea/
+.vscode/
+
+__pycache__/
+*.py[cod]
+
+# Runtime server state and Syncthing conflict copies.
+/data/
+*.sync-conflict-*
+
+# Generated distribution archive; sources live in the directory below.
+smarty_nuclear_advancements.zip
+
+# Local secrets and environment files.
+.env
+.env.*
+!.env.example
