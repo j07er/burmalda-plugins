@@ -8,7 +8,8 @@ xray.py — Статистический монитор добычи и спек
  - Защита от ложных срабатываний (дедупликация жил, фильтр высоты, защита от Silk Touch)
  - Жёсткий порог чувствительности (>6% алмазов/камня или 2 алмазные жилы за 2 минуты)
  - Спектаторский инструментарий (/xray spec <ник> с авто-сохранением точки и /xray back)
- - Интерактивное GUI-меню (/xray gui) со списком подозреваемых и детальной карточкой
+ - Интерактивное GUI-меню (/xray gui) со списком всех игроков и детальной карточкой
+ - Приватная подсветка алмазов и древних обломков для администратора (/xray showore)
  - Долговременное хранение истории добычи в data/xray_stats.json
 """
 
@@ -20,8 +21,8 @@ import pyspigot as ps
 from java.lang import System
 from java.util import ArrayList
 
-from org.bukkit import Bukkit, Material, Sound, GameMode, NamespacedKey
-from org.bukkit.entity import Player
+from org.bukkit import Bukkit, Material, Sound, GameMode, NamespacedKey, Color
+from org.bukkit.entity import Player, EntityType
 from org.bukkit.event.block import BlockBreakEvent, BlockPlaceEvent
 from org.bukkit.event.inventory import InventoryClickEvent, InventoryCloseEvent
 from org.bukkit.event.player import PlayerQuitEvent
@@ -32,6 +33,7 @@ from org.bukkit.persistence import PersistentDataType
 # Инициализация менеджеров PySpigot
 cmd_mgr = ps.command_manager()
 listener_mgr = ps.listener_manager()
+scheduler = ps.scheduler
 
 # -------------------------------------------------------------------------
 # КОНСТАНТЫ И ТИПЫ РУД
@@ -81,6 +83,22 @@ STONE_TYPES = set([
     Material.BLACKSTONE
 ])
 
+# Персональная подсветка руды. Сканирование разбито по тикам и никогда не
+# загружает чанки, поэтому один администратор не создаёт тяжёлый полный проход.
+SHOW_ORE_TYPES = set([
+    Material.DIAMOND_ORE,
+    Material.DEEPSLATE_DIAMOND_ORE,
+    Material.ANCIENT_DEBRIS,
+])
+SHOW_ORE_HORIZONTAL_RADIUS = 24
+SHOW_ORE_VERTICAL_RADIUS = 16
+SHOW_ORE_BLOCKS_PER_TICK = 1400
+SHOW_ORE_RESCAN_DELAY_TICKS = 40
+SHOW_ORE_MAX_MARKERS = 512
+SHOW_ORE_MARKER_TAG = "xray_showore"
+SHOW_ORE_DIAMOND_COLOR = Color.fromRGB(40, 220, 255)
+SHOW_ORE_DEBRIS_COLOR = Color.fromRGB(255, 120, 35)
+
 # Пороги тревоги (Strict - Жёсткий)
 MIN_STONE_SAMPLE = 80           # Минимум пустых блоков перед расчётом процента
 ALERT_DIAMOND_RATIO = 6.0       # > 6.0% алмазов к камню = Тревога
@@ -108,6 +126,14 @@ spec_back_cache = {}
 
 # Открытые GUI: uuid_admin -> dict
 open_guis = {}
+
+# uuid_admin -> {"player": Player, "markers": dict, "scan": dict|None,
+#                "next_scan_tick": int, "limit_reported": bool}
+showore_states = {}
+showore_loop_running = False
+showore_tick_counter = 0
+pyspigot_plugin = None
+showore_marker_api_failed = False
 
 
 # -------------------------------------------------------------------------
@@ -158,6 +184,12 @@ def format_coords(loc):
     if not loc:
         return u"?"
     return u"%d, %d, %d (%s)" % (loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), loc.getWorld().getName())
+
+def get_pyspigot_plugin():
+    global pyspigot_plugin
+    if pyspigot_plugin is None or not pyspigot_plugin.isEnabled():
+        pyspigot_plugin = Bukkit.getPluginManager().getPlugin("PySpigot")
+    return pyspigot_plugin
 
 # -------------------------------------------------------------------------
 # ЗАГРУЗКА И СОХРАНЕНИЕ ДАННЫХ
@@ -254,46 +286,53 @@ def make_player_head(nick, name, lore_list, action=None, param=None):
     return item
 
 # -------------------------------------------------------------------------
-# GUI: СПИСОК ПОДОЗРЕВАЕМЫХ (XrayMonitorGUI — 54 СЛОТА)
+# GUI: СПИСОК ВСЕХ ИГРОКОВ (XrayMonitorGUI — 54 СЛОТА)
 # -------------------------------------------------------------------------
 def open_monitor_gui(player, page=0):
     if not _is_admin(player):
         player.sendMessage(u"§c✗ §7Доступ к монитору X-Ray только для администрации.")
         return
 
-    inv = Bukkit.createInventory(None, 54, u"§8[XRAY] §0Подозреваемые (Стр. %d)" % (page + 1))
+    # Игроки без единого сломанного блока тоже должны появиться в меню.
+    for online_player in Bukkit.getOnlinePlayers():
+        get_player_stats(online_player)
 
-    flagged_players = []
-    for u_key, pdata in state["players"].items():
-        if pdata.get("suspicious") or pdata.get("alarms_count", 0) > 0 or pdata.get("diamond_blocks", 0) > 20:
-            flagged_players.append((u_key, pdata))
+    tracked_players = list(state["players"].items())
+    online_nicks = set([_norm(p.getName()) for p in Bukkit.getOnlinePlayers()])
+    tracked_players.sort(key=lambda x: (
+        0 if _norm(x[1].get("nick", u"")) in online_nicks else 1,
+        _norm(x[1].get("nick", u""))
+    ))
 
-    flagged_players.sort(key=lambda x: (-x[1].get("alarms_count", 0), x[1].get("nick", u"").lower()))
+    max_page = max(0, (len(tracked_players) - 1) // 36)
+    page = max(0, min(page, max_page))
+    inv = Bukkit.createInventory(None, 54, u"§8[XRAY] §0Игроки (Стр. %d)" % (page + 1))
 
     lore_summary = [
-        u"§7Подозреваемых игроков в базе: §c" + str(len(flagged_players)),
+        u"§7Игроков в базе: §f" + str(len(tracked_players)),
         u"§8---------------------------",
-        u"§7Сортировка по количеству тревог.",
+        u"§7Сначала онлайн, затем по алфавиту.",
         u"",
         u"§eЛКМ по игроку §7— открыть карточку проверки"
     ]
-    inv.setItem(4, make_item(Material.REDSTONE_LAMP, u"§c§lМонитор X-Ray", lore_summary))
+    inv.setItem(4, make_item(Material.SPYGLASS, u"§e§lМонитор игроков", lore_summary))
 
     start_idx = page * 36
-    end_idx = min(start_idx + 36, len(flagged_players))
+    end_idx = min(start_idx + 36, len(tracked_players))
 
     for i in range(start_idx, end_idx):
         slot = 9 + (i - start_idx)
-        u_key, pdata = flagged_players[i]
+        u_key, pdata = tracked_players[i]
         nick = pdata.get("nick", u"Игрок")
         is_on = (Bukkit.getPlayerExact(nick) is not None)
         status_str = u"§a● Онлайн" if is_on else u"§c○ Оффлайн"
 
-        stone = max(1, pdata.get("stone_mined", 0))
+        stone = pdata.get("stone_mined", 0)
+        ratio_base = max(1, stone)
         d_blocks = pdata.get("diamond_blocks", 0)
-        d_ratio = (d_blocks / float(stone)) * 100.0
+        d_ratio = (d_blocks / float(ratio_base)) * 100.0
         deb_blocks = pdata.get("debris_blocks", 0)
-        deb_ratio = (deb_blocks / float(stone)) * 100.0
+        deb_ratio = (deb_blocks / float(ratio_base)) * 100.0
         alarms = pdata.get("alarms_count", 0)
 
         lore_head = [
@@ -310,7 +349,7 @@ def open_monitor_gui(player, page=0):
 
     if start_idx > 0:
         inv.setItem(45, make_item(Material.ARROW, u"§a§l<- Предыдущая страница", [u"§7На страницу назад"], "page", str(page - 1)))
-    if end_idx < len(flagged_players):
+    if end_idx < len(tracked_players):
         inv.setItem(53, make_item(Material.ARROW, u"§a§lСледующая страница ->", [u"§7На страницу вперед"], "page", str(page + 1)))
 
     inv.setItem(49, make_item(Material.BARRIER, u"§c§lЗакрыть меню", [u"§7Закрыть окно монитора"], "close_gui"))
@@ -319,7 +358,7 @@ def open_monitor_gui(player, page=0):
     open_guis[uid(player)] = {"view": "monitor", "page": page}
 
 # -------------------------------------------------------------------------
-# GUI: ПОДМЕНЮ ПОДОЗРЕВАЕМОГО ИГРОКА (27 СЛОТОВ)
+# GUI: КАРТОЧКА ИГРОКА (27 СЛОТОВ)
 # -------------------------------------------------------------------------
 def open_player_submenu(admin, target_nick):
     if not _is_admin(admin):
@@ -342,13 +381,14 @@ def open_player_submenu(admin, target_nick):
 
     inv = Bukkit.createInventory(None, 27, u"§8[XRAY] §0Проверка: " + target_nick)
 
-    stone = max(1, pdata.get("stone_mined", 0))
+    stone = pdata.get("stone_mined", 0)
+    ratio_base = max(1, stone)
     d_blocks = pdata.get("diamond_blocks", 0)
     d_veins = pdata.get("diamond_veins", 0)
-    d_ratio = (d_blocks / float(stone)) * 100.0
+    d_ratio = (d_blocks / float(ratio_base)) * 100.0
     deb_blocks = pdata.get("debris_blocks", 0)
     deb_veins = pdata.get("debris_veins", 0)
-    deb_ratio = (deb_blocks / float(stone)) * 100.0
+    deb_ratio = (deb_blocks / float(ratio_base)) * 100.0
     alarms = pdata.get("alarms_count", 0)
 
     breakdown = pdata.get("ores_breakdown", {})
@@ -659,18 +699,299 @@ def execute_stats(sender, target_nick):
         return
     for u_key, pdata in state["players"].items():
         if pdata.get("nick", u"").lower() == target_nick.lower():
-            stone = max(1, pdata.get("stone_mined", 0))
-            d_ratio = (pdata.get("diamond_blocks", 0) / float(stone)) * 100.0
-            deb_ratio = (pdata.get("debris_blocks", 0) / float(stone)) * 100.0
+            stone = pdata.get("stone_mined", 0)
+            ratio_base = max(1, stone)
+            d_ratio = (pdata.get("diamond_blocks", 0) / float(ratio_base)) * 100.0
+            deb_ratio = (pdata.get("debris_blocks", 0) / float(ratio_base)) * 100.0
             sender.sendMessage(u"§8[XRAY] §7Статистика §f" + target_nick + u"§7:")
             sender.sendMessage(u"  §7Камень: §f%d §8| §7Алмазы: §b%.1f%% §8| §7Незерит: §6%.1f%%" % (stone, d_ratio, deb_ratio))
             sender.sendMessage(u"  §7Срабатываний: §c%d" % pdata.get("alarms_count", 0))
             return
     sender.sendMessage(u"§c✗ §7Игрок §f" + target_nick + u" §7не найден в базе.")
 
+# -------------------------------------------------------------------------
+# ПЕРСОНАЛЬНАЯ ПОДСВЕТКА РУДЫ (/xray showore)
+# -------------------------------------------------------------------------
+def _remove_showore_marker(marker):
+    try:
+        if marker is not None and marker.isValid():
+            marker.remove()
+    except Exception:
+        pass
+
+def _clear_showore_markers(show_state):
+    for marker in list(show_state.get("markers", {}).values()):
+        _remove_showore_marker(marker)
+    show_state["markers"] = {}
+    show_state["scan"] = None
+
+def _remove_showore_state(admin_uid):
+    show_state = showore_states.pop(admin_uid, None)
+    if show_state:
+        _clear_showore_markers(show_state)
+    return show_state
+
+def enable_showore(player):
+    if not _is_admin(player):
+        player.sendMessage(u"§c✗ §7Команда доступна только администрации.")
+        return
+
+    admin_uid = uid(player)
+    if admin_uid in showore_states:
+        player.sendMessage(u"§e◆ §7Подсветка руды уже включена. Выключить: §f/xray showore off")
+        return
+
+    plugin = get_pyspigot_plugin()
+    if plugin is None or not plugin.isEnabled():
+        player.sendMessage(u"§c✗ §7Не удалось получить экземпляр PySpigot для приватной подсветки.")
+        Bukkit.getLogger().warning("[xray_detector] PySpigot plugin instance not found; showore disabled.")
+        return
+
+    showore_states[admin_uid] = {
+        "player": player,
+        "markers": {},
+        "scan": None,
+        "next_scan_tick": 0,
+        "limit_reported": False,
+        "world_uid": None,
+    }
+    player.sendMessage(u"§a✓ §7Подсветка руды включена только для вас.")
+    player.sendMessage(u"§bАлмазы §7подсвечены голубым, §6древние обломки §7— оранжевым.")
+    player.sendMessage(u"§7Радиус: §f%d блоков§7. Выключить: §f/xray showore off" % SHOW_ORE_HORIZONTAL_RADIUS)
+
+def disable_showore(player, notify=True):
+    removed = _remove_showore_state(uid(player))
+    if notify:
+        if removed:
+            player.sendMessage(u"§a✓ §7Подсветка руды выключена, все маркеры удалены.")
+        else:
+            player.sendMessage(u"§e◆ §7Подсветка руды уже выключена.")
+
+def toggle_showore(player, requested_mode=None):
+    if not _is_admin(player):
+        player.sendMessage(u"§c✗ §7Команда доступна только администрации.")
+        return
+
+    enabled = uid(player) in showore_states
+    if requested_mode == u"on":
+        if enabled:
+            player.sendMessage(u"§e◆ §7Подсветка руды уже включена.")
+        else:
+            enable_showore(player)
+    elif requested_mode == u"off":
+        disable_showore(player, True)
+    elif enabled:
+        disable_showore(player, True)
+    else:
+        enable_showore(player)
+
+def _begin_showore_scan(show_state):
+    player = show_state["player"]
+    loc = player.getLocation()
+    world = loc.getWorld()
+    world_uid = world.getUID().toString()
+
+    if show_state.get("world_uid") != world_uid:
+        _clear_showore_markers(show_state)
+        show_state["world_uid"] = world_uid
+
+    center_x = loc.getBlockX()
+    center_y = loc.getBlockY()
+    center_z = loc.getBlockZ()
+    min_y = max(world.getMinHeight(), center_y - SHOW_ORE_VERTICAL_RADIUS)
+    max_y = min(world.getMaxHeight() - 1, center_y + SHOW_ORE_VERTICAL_RADIUS)
+    width = SHOW_ORE_HORIZONTAL_RADIUS * 2 + 1
+    depth = width
+    height = max_y - min_y + 1
+
+    loaded_chunks = set()
+    min_chunk_x = (center_x - SHOW_ORE_HORIZONTAL_RADIUS) >> 4
+    max_chunk_x = (center_x + SHOW_ORE_HORIZONTAL_RADIUS) >> 4
+    min_chunk_z = (center_z - SHOW_ORE_HORIZONTAL_RADIUS) >> 4
+    max_chunk_z = (center_z + SHOW_ORE_HORIZONTAL_RADIUS) >> 4
+    for chunk_x in range(min_chunk_x, max_chunk_x + 1):
+        for chunk_z in range(min_chunk_z, max_chunk_z + 1):
+            if world.isChunkLoaded(chunk_x, chunk_z):
+                loaded_chunks.add((chunk_x, chunk_z))
+
+    show_state["scan"] = {
+        "world": world,
+        "world_uid": world_uid,
+        "min_x": center_x - SHOW_ORE_HORIZONTAL_RADIUS,
+        "min_y": min_y,
+        "min_z": center_z - SHOW_ORE_HORIZONTAL_RADIUS,
+        "width": width,
+        "depth": depth,
+        "height": height,
+        "total": width * depth * height,
+        "index": 0,
+        "seen": set(),
+        "loaded_chunks": loaded_chunks,
+    }
+
+def _spawn_showore_marker(player, block, material):
+    global showore_marker_api_failed
+    plugin = get_pyspigot_plugin()
+    if plugin is None or not plugin.isEnabled():
+        showore_marker_api_failed = True
+        return None
+
+    marker = None
+    try:
+        marker = block.getWorld().spawnEntity(block.getLocation(), EntityType.BLOCK_DISPLAY)
+        marker.setPersistent(False)
+        marker.setInvulnerable(True)
+        marker.setGravity(False)
+        marker.setSilent(True)
+        marker.setBlock(block.getBlockData())
+        marker.setGlowing(True)
+        if material == Material.ANCIENT_DEBRIS:
+            marker.setGlowColorOverride(SHOW_ORE_DEBRIS_COLOR)
+        else:
+            marker.setGlowColorOverride(SHOW_ORE_DIAMOND_COLOR)
+        marker.setViewRange(1.0)
+        marker.addScoreboardTag(SHOW_ORE_MARKER_TAG)
+
+        # По умолчанию сущность не отправляется ни одному клиенту. Paper явно
+        # показывает её только администратору, который включил команду.
+        marker.setVisibleByDefault(False)
+        player.showEntity(plugin, marker)
+        return marker
+    except Exception as ex:
+        _remove_showore_marker(marker)
+        if not showore_marker_api_failed:
+            Bukkit.getLogger().warning("[xray_detector] showore marker error: " + str(ex))
+        showore_marker_api_failed = True
+        return None
+
+def _process_showore_state(show_state, block_budget):
+    global showore_tick_counter
+    player = show_state.get("player")
+    if player is None or not player.isOnline():
+        return False
+
+    current_world_uid = player.getWorld().getUID().toString()
+    if show_state.get("world_uid") not in (None, current_world_uid):
+        _clear_showore_markers(show_state)
+        show_state["world_uid"] = current_world_uid
+        show_state["next_scan_tick"] = 0
+
+    if show_state.get("scan") is None:
+        if showore_tick_counter < show_state.get("next_scan_tick", 0):
+            return True
+        _begin_showore_scan(show_state)
+
+    scan = show_state["scan"]
+    world = scan["world"]
+    markers = show_state["markers"]
+    processed = 0
+
+    while scan["index"] < scan["total"] and processed < block_budget:
+        index = scan["index"]
+        scan["index"] = index + 1
+        processed += 1
+
+        column_size = scan["depth"] * scan["height"]
+        x_offset = index // column_size
+        column_index = index % column_size
+        z_offset = column_index // scan["height"]
+        y_offset = column_index % scan["height"]
+        block_x = scan["min_x"] + x_offset
+        block_y = scan["min_y"] + y_offset
+        block_z = scan["min_z"] + z_offset
+
+        chunk_key = (block_x >> 4, block_z >> 4)
+        if y_offset == 0:
+            scan["column_loaded"] = (
+                chunk_key in scan["loaded_chunks"] and
+                world.isChunkLoaded(chunk_key[0], chunk_key[1])
+            )
+        if not scan.get("column_loaded", False):
+            continue
+
+        block = world.getBlockAt(block_x, block_y, block_z)
+        material = block.getType()
+        if material not in SHOW_ORE_TYPES:
+            continue
+
+        marker_key = (scan["world_uid"], block_x, block_y, block_z)
+        scan["seen"].add(marker_key)
+        marker = markers.get(marker_key)
+        if marker is not None:
+            try:
+                if marker.isValid() and marker.getBlock().getMaterial() == material:
+                    continue
+            except Exception:
+                pass
+            _remove_showore_marker(marker)
+            markers.pop(marker_key, None)
+
+        if len(markers) >= SHOW_ORE_MAX_MARKERS:
+            if not show_state.get("limit_reported"):
+                show_state["limit_reported"] = True
+                player.sendMessage(u"§e◆ §7Достигнут безопасный лимит в §f%d §7маркеров руды." % SHOW_ORE_MAX_MARKERS)
+            continue
+
+        marker = _spawn_showore_marker(player, block, material)
+        if marker is not None:
+            markers[marker_key] = marker
+        elif showore_marker_api_failed:
+            player.sendMessage(u"§c✗ §7Подсветка отключена: сервер не поддержал визуальные маркеры Paper.")
+            return False
+
+    if scan["index"] >= scan["total"]:
+        seen = scan["seen"]
+        for marker_key, marker in list(markers.items()):
+            if marker_key not in seen:
+                _remove_showore_marker(marker)
+                markers.pop(marker_key, None)
+        show_state["scan"] = None
+        show_state["next_scan_tick"] = showore_tick_counter + SHOW_ORE_RESCAN_DELAY_TICKS
+
+    return True
+
+def _showore_tick():
+    global showore_tick_counter
+    if not showore_loop_running:
+        return
+
+    showore_tick_counter += 1
+    active_ids = list(showore_states.keys())
+    if active_ids:
+        # Общий бюджет остаётся постоянным даже при нескольких администраторах.
+        per_admin_budget = max(1, SHOW_ORE_BLOCKS_PER_TICK // len(active_ids))
+        for admin_uid in active_ids:
+            show_state = showore_states.get(admin_uid)
+            if show_state is None:
+                continue
+            try:
+                if not _process_showore_state(show_state, per_admin_budget):
+                    _remove_showore_state(admin_uid)
+            except Exception as ex:
+                Bukkit.getLogger().warning("[xray_detector] showore scan error: " + str(ex))
+                _remove_showore_state(admin_uid)
+
+    if showore_loop_running:
+        scheduler.runTaskLater(_showore_tick, 1)
+
 def on_xray_command(sender, label, args):
     args_list = [_norm(x) for x in args]
     sub = args_list[0] if len(args_list) > 0 else u"gui"
+
+    if not _is_admin(sender):
+        sender.sendMessage(u"§c✗ §7Команда доступна только администрации.")
+        return True
+
+    if sub == u"showore":
+        if not isinstance(sender, Player):
+            sender.sendMessage(u"Подсветку руды может включить только игрок.")
+            return True
+        mode = args_list[1] if len(args_list) >= 2 else None
+        if mode not in (None, u"on", u"off"):
+            sender.sendMessage(u"§7Использование: §e/xray showore [on|off]")
+            return True
+        toggle_showore(sender, mode)
+        return True
 
     if sub in (u"gui", u"menu"):
         if isinstance(sender, Player):
@@ -707,27 +1028,31 @@ def on_xray_command(sender, label, args):
         return True
 
     sender.sendMessage(u"§8[XRAY] §7Команды модератора:")
-    sender.sendMessage(u"  §e/xray gui §7— открыть монитор подозреваемых")
+    sender.sendMessage(u"  §e/xray gui §7— открыть монитор всех игроков")
     sender.sendMessage(u"  §e/xray spec <ник> §7— телепорт к игроку в режиме наблюдателя")
     sender.sendMessage(u"  §e/xray back §7— возврат на свою точку из спека")
+    sender.sendMessage(u"  §e/xray showore [on|off] §7— приватная подсветка руды")
     sender.sendMessage(u"  §e/xray inv <ник> §7— проверить инвентарь игрока")
     sender.sendMessage(u"  §e/xray reset <ник> §7— обнулить подозрения")
     sender.sendMessage(u"  §e/xray stats <ник> §7— вывести статистику в чат")
     return True
 
 # -------------------------------------------------------------------------
-# ОБРАБОТЧИК ВЫХОДА АДМИНА ИЗ ИГРЫ (ЧИСТКА КЕША СПЕКТАТОРА)
+# ОБРАБОТЧИК ВЫХОДА АДМИНА ИЗ ИГРЫ (ЧИСТКА ВРЕМЕННЫХ ДАННЫХ)
 # -------------------------------------------------------------------------
 def on_player_quit(event):
     player = event.getPlayer()
     u = uid(player)
     if u in spec_back_cache:
         spec_back_cache.pop(u, None)
+    if u in showore_states:
+        _remove_showore_state(u)
 
 # -------------------------------------------------------------------------
 # РЕГИСТРАЦИЯ СЛУШАТЕЛЕЙ И КОМАНД
 # -------------------------------------------------------------------------
 def on_enable():
+    global showore_loop_running, showore_tick_counter
     _load()
     listener_mgr.registerListener(on_block_break, BlockBreakEvent)
     listener_mgr.registerListener(on_block_place, BlockPlaceEvent)
@@ -743,9 +1068,17 @@ def on_enable():
         except Exception as ex:
             Bukkit.getLogger().warning("[xray_detector] registerCommand fallback: " + str(ex))
 
-    Bukkit.getLogger().info("[xray_detector] X-Ray monitor and spectator toolkit loaded.")
+    showore_tick_counter = 0
+    showore_loop_running = True
+    scheduler.runTaskLater(_showore_tick, 1)
+
+    Bukkit.getLogger().info("[xray_detector] X-Ray monitor, spectator and private ore highlighter loaded.")
 
 def on_disable():
+    global showore_loop_running
+    showore_loop_running = False
+    for admin_uid in list(showore_states.keys()):
+        _remove_showore_state(admin_uid)
     _save()
     Bukkit.getLogger().info("[xray_detector] Disabled.")
 
