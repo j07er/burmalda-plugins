@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-xray_detector.py — Продвинутый статистический детектор X-Ray и спектаторская панель
+xray.py — Статистический монитор добычи и спектаторская панель
 Для PySpigot 0.9.1 (Jython 2.7) + Paper 1.21.11
 
 Особенности:
- - Взвешенный анализ всех типов обычной и глубинной (Deepslate) руды
+ - Учёт всех типов обычной и глубинной (Deepslate) руды
  - Защита от ложных срабатываний (дедупликация жил, фильтр высоты, защита от Silk Touch)
  - Жёсткий порог чувствительности (>6% алмазов/камня или 2 алмазные жилы за 2 минуты)
- - Кликабельные алерты в чат модераторам [ТП Наблюдателем] [Инвентарь] [Сброс] [GUI]
  - Спектаторский инструментарий (/xray spec <ник> с авто-сохранением точки и /xray back)
- - Встроенная система невидимки (Vanish) в режиме спектатора:
-    * При /xray spec модератор скрывается от игроков (включая Tab) и пишется фейковый выход из игры
-    * При /xray back модератор возвращается, становится видимым и пишется фейковый вход в игру
  - Интерактивное GUI-меню (/xray gui) со списком подозреваемых и детальной карточкой
  - Долговременное хранение истории добычи в data/xray_stats.json
 """
@@ -19,17 +15,16 @@ xray_detector.py — Продвинутый статистический дет�
 import os
 import io
 import json
-import time
 
 import pyspigot as ps
-from java.lang import System, Byte as JByte, Long as JLong
-from java.util import ArrayList, HashMap, HashSet
+from java.lang import System
+from java.util import ArrayList
 
-from org.bukkit import Bukkit, Material, Sound, Location, GameMode, NamespacedKey
+from org.bukkit import Bukkit, Material, Sound, GameMode, NamespacedKey
 from org.bukkit.entity import Player
 from org.bukkit.event.block import BlockBreakEvent, BlockPlaceEvent
 from org.bukkit.event.inventory import InventoryClickEvent, InventoryCloseEvent
-from org.bukkit.event.player import PlayerJoinEvent, PlayerQuitEvent
+from org.bukkit.event.player import PlayerQuitEvent
 from org.bukkit.inventory import ItemStack
 from org.bukkit.inventory.meta import SkullMeta
 from org.bukkit.persistence import PersistentDataType
@@ -37,10 +32,9 @@ from org.bukkit.persistence import PersistentDataType
 # Инициализация менеджеров PySpigot
 cmd_mgr = ps.command_manager()
 listener_mgr = ps.listener_manager()
-scheduler = ps.scheduler
 
 # -------------------------------------------------------------------------
-# КОНСТАНТЫ И ВЕСА РУД (WEIGHTED ORE SCORING)
+# КОНСТАНТЫ И ТИПЫ РУД
 # -------------------------------------------------------------------------
 KEY_GUI_ACTION = NamespacedKey.fromString("xray:action")
 KEY_GUI_PARAM = NamespacedKey.fromString("xray:param")
@@ -50,28 +44,27 @@ DATA_FILE = os.path.join(DATA_DIR, "xray_stats.json")
 
 ADMIN_NAMES = set([u"blueredtronce"])
 
-# Весовые баллы опасности для каждой руды
-ORE_WEIGHTS = {
-    Material.ANCIENT_DEBRIS: 12,
-    Material.DIAMOND_ORE: 10,
-    Material.DEEPSLATE_DIAMOND_ORE: 10,
-    Material.EMERALD_ORE: 5,
-    Material.DEEPSLATE_EMERALD_ORE: 5,
-    Material.GOLD_ORE: 5,
-    Material.DEEPSLATE_GOLD_ORE: 5,
-    Material.NETHER_GOLD_ORE: 3,
-    Material.IRON_ORE: 2,
-    Material.DEEPSLATE_IRON_ORE: 2,
-    Material.LAPIS_ORE: 2,
-    Material.DEEPSLATE_LAPIS_ORE: 2,
-    Material.COAL_ORE: 1,
-    Material.DEEPSLATE_COAL_ORE: 1,
-    Material.COPPER_ORE: 1,
-    Material.DEEPSLATE_COPPER_ORE: 1,
-    Material.REDSTONE_ORE: 1,
-    Material.DEEPSLATE_REDSTONE_ORE: 1,
-    Material.NETHER_QUARTZ_ORE: 1
-}
+ORE_TYPES = set([
+    Material.ANCIENT_DEBRIS,
+    Material.DIAMOND_ORE,
+    Material.DEEPSLATE_DIAMOND_ORE,
+    Material.EMERALD_ORE,
+    Material.DEEPSLATE_EMERALD_ORE,
+    Material.GOLD_ORE,
+    Material.DEEPSLATE_GOLD_ORE,
+    Material.NETHER_GOLD_ORE,
+    Material.IRON_ORE,
+    Material.DEEPSLATE_IRON_ORE,
+    Material.LAPIS_ORE,
+    Material.DEEPSLATE_LAPIS_ORE,
+    Material.COAL_ORE,
+    Material.DEEPSLATE_COAL_ORE,
+    Material.COPPER_ORE,
+    Material.DEEPSLATE_COPPER_ORE,
+    Material.REDSTONE_ORE,
+    Material.DEEPSLATE_REDSTONE_ORE,
+    Material.NETHER_QUARTZ_ORE,
+])
 
 # Пустые породы (для знаменателя статистики)
 STONE_TYPES = set([
@@ -92,7 +85,6 @@ STONE_TYPES = set([
 MIN_STONE_SAMPLE = 80           # Минимум пустых блоков перед расчётом процента
 ALERT_DIAMOND_RATIO = 6.0       # > 6.0% алмазов к камню = Тревога
 ALERT_DEBRIS_RATIO = 4.0        # > 4.0% незерита к камню = Тревога
-ALERT_WEIGHTED_SCORE = 150      # Взвешенный балл > 150 за выборку 100 камня
 FAST_VEIN_DIAMOND_SEC = 120     # 2 алмазные жилы за 120 сек (2 минуты)
 FAST_VEIN_DEBRIS_SEC = 180      # 2 незеритовые жилы за 180 сек (3 минуты)
 
@@ -157,7 +149,7 @@ def _is_admin(sender):
     # Это была настоящая эскалация привилегий: любой игрок с правом городского
     # администратора (например, мэр или модератор городов через LuckPerms)
     # автоматически получал полные права администратора X-Ray детектора - мог
-    # телепортироваться в невидимом spectator-режиме к любому игроку, открывать
+    # телепортироваться в spectator-режиме к любому игроку, открывать
     # чужие инвентари, сбрасывать чужие подозрения и открывать GUI-монитор -
     # хотя ему никогда не выдавали именно "smarty.xray.admin".
     return sender.getName().lower() in ADMIN_NAMES or sender.isOp() or sender.hasPermission("smarty.xray.admin")
@@ -166,22 +158,6 @@ def format_coords(loc):
     if not loc:
         return u"?"
     return u"%d, %d, %d (%s)" % (loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), loc.getWorld().getName())
-
-def get_pyspigot_plugin():
-    try:
-        pm = Bukkit.getPluginManager()
-        plugin = pm.getPlugin("PySpigot")
-        if plugin:
-            return plugin
-        for p in pm.getPlugins():
-            if "pyspigot" in str(p.getName()).lower():
-                return p
-        plugins = pm.getPlugins()
-        if len(plugins) > 0:
-            return plugins[0]
-    except Exception:
-        pass
-    return None
 
 # -------------------------------------------------------------------------
 # ЗАГРУЗКА И СОХРАНЕНИЕ ДАННЫХ
@@ -201,6 +177,8 @@ def _load():
             state = json.loads(raw)
             if "players" not in state:
                 state["players"] = {}
+            for pdata in state["players"].values():
+                pdata.pop("weighted_score", None)
     except Exception as ex:
         Bukkit.getLogger().warning("[xray_detector] load error: " + str(ex))
         state = {"players": {}}
@@ -231,7 +209,6 @@ def get_player_stats(player):
             "diamond_veins": 0,
             "debris_blocks": 0,
             "debris_veins": 0,
-            "weighted_score": 0,
             "suspicious": False,
             "alarms_count": 0,
             "ores_breakdown": {}
@@ -240,43 +217,6 @@ def get_player_stats(player):
     else:
         pdata["nick"] = _to_unicode(player.getName())
     return pdata
-
-# -------------------------------------------------------------------------
-# КЛИКАБЕЛЬНЫЙ АЛЕРТ В ЧАТ МОДЕРАТОРАМ (BUNGEE / SPIGOT CHAT API)
-# -------------------------------------------------------------------------
-def send_clickable_alert(target_nick, reason, diam_ratio, deb_ratio, score):
-    msg_top = u"§8[§c§lX-RAY§8] §f§l" + target_nick + u" §7подозревается в X-Ray! §8(" + reason + u"§8)"
-    msg_stat = u"§7Алмазы: §b%.1f%% §8| §7Незерит: §6%.1f%% §8| §7Вес: §e%d" % (diam_ratio, deb_ratio, score)
-
-    for p in Bukkit.getOnlinePlayers():
-        if _is_admin(p):
-            p.sendMessage(msg_top)
-            p.sendMessage(msg_stat)
-            p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1.0, 1.2)
-            try:
-                from net.md_5.bungee.api.chat import TextComponent, ClickEvent, HoverEvent, ComponentBuilder
-                row = TextComponent(u"§a§l[ТП Наблюдателем] ")
-                row.setClickEvent(ClickEvent(ClickEvent.Action.RUN_COMMAND, u"/xray spec " + target_nick))
-                row.setHoverEvent(HoverEvent(HoverEvent.Action.SHOW_TEXT, ComponentBuilder(u"§aТелепорт в GameMode.SPECTATOR к игроку (скрытно)").create()))
-
-                btn_inv = TextComponent(u"§e§l[Инвентарь] ")
-                btn_inv.setClickEvent(ClickEvent(ClickEvent.Action.RUN_COMMAND, u"/xray inv " + target_nick))
-                btn_inv.setHoverEvent(HoverEvent(HoverEvent.Action.SHOW_TEXT, ComponentBuilder(u"§eОткрыть инвентарь игрока").create()))
-
-                btn_reset = TextComponent(u"§c§l[Сбросить] ")
-                btn_reset.setClickEvent(ClickEvent(ClickEvent.Action.RUN_COMMAND, u"/xray reset " + target_nick))
-                btn_reset.setHoverEvent(HoverEvent(HoverEvent.Action.SHOW_TEXT, ComponentBuilder(u"§cСбросить счётчики подозрения").create()))
-
-                btn_gui = TextComponent(u"§b§l[GUI Меню]")
-                btn_gui.setClickEvent(ClickEvent(ClickEvent.Action.RUN_COMMAND, u"/xray gui"))
-                btn_gui.setHoverEvent(HoverEvent(HoverEvent.Action.SHOW_TEXT, ComponentBuilder(u"§bОткрыть список всех подозреваемых в GUI").create()))
-
-                row.addExtra(btn_inv)
-                row.addExtra(btn_reset)
-                row.addExtra(btn_gui)
-                p.spigot().sendMessage(row)
-            except Exception:
-                p.sendMessage(u"§7Команды: §a/xray spec " + target_nick + u" §8| §e/xray inv " + target_nick + u" §8| §b/xray gui")
 
 # -------------------------------------------------------------------------
 # ГЕНЕРАТОРЫ ИКОНОК GUI
@@ -328,13 +268,12 @@ def open_monitor_gui(player, page=0):
         if pdata.get("suspicious") or pdata.get("alarms_count", 0) > 0 or pdata.get("diamond_blocks", 0) > 20:
             flagged_players.append((u_key, pdata))
 
-    flagged_players.sort(key=lambda x: (-x[1].get("alarms_count", 0), -x[1].get("weighted_score", 0), x[1].get("nick", u"").lower()))
+    flagged_players.sort(key=lambda x: (-x[1].get("alarms_count", 0), x[1].get("nick", u"").lower()))
 
     lore_summary = [
         u"§7Подозреваемых игроков в базе: §c" + str(len(flagged_players)),
         u"§8---------------------------",
-        u"§7Сортировка по количеству тревог",
-        u"§7и взвешенному баллу опасности.",
+        u"§7Сортировка по количеству тревог.",
         u"",
         u"§eЛКМ по игроку §7— открыть карточку проверки"
     ]
@@ -355,7 +294,6 @@ def open_monitor_gui(player, page=0):
         d_ratio = (d_blocks / float(stone)) * 100.0
         deb_blocks = pdata.get("debris_blocks", 0)
         deb_ratio = (deb_blocks / float(stone)) * 100.0
-        score = pdata.get("weighted_score", 0)
         alarms = pdata.get("alarms_count", 0)
 
         lore_head = [
@@ -365,7 +303,6 @@ def open_monitor_gui(player, page=0):
             u"§7Выкопано пустой породы: §f%d" % stone,
             u"§7Алмазная руда: §b%d §7(§b%.1f%%§7)" % (d_blocks, d_ratio),
             u"§7Древние обломки: §6%d §7(§6%.1f%%§7)" % (deb_blocks, deb_ratio),
-            u"§7Взвешенный балл риска: §e%d" % score,
             u"§8---------------------------",
             u"§eЛКМ §7— Открыть управление и спектатор"
         ]
@@ -412,7 +349,6 @@ def open_player_submenu(admin, target_nick):
     deb_blocks = pdata.get("debris_blocks", 0)
     deb_veins = pdata.get("debris_veins", 0)
     deb_ratio = (deb_blocks / float(stone)) * 100.0
-    score = pdata.get("weighted_score", 0)
     alarms = pdata.get("alarms_count", 0)
 
     breakdown = pdata.get("ores_breakdown", {})
@@ -429,7 +365,6 @@ def open_player_submenu(admin, target_nick):
         u"§7Камень / Сланец: §f%d" % stone,
         u"§7Алмазы: §b%d шт. §7(%d жил, §b%.1f%%§7)" % (d_blocks, d_veins, d_ratio),
         u"§7Древние обломки: §6%d шт. §7(%d жил, §6%.1f%%§7)" % (deb_blocks, deb_veins, deb_ratio),
-        u"§7Взвешенный балл: §e%d" % score,
         u"§8---------------------------",
         u"§7Детализация добычи:"
     ] + breakdown_lines
@@ -437,14 +372,13 @@ def open_player_submenu(admin, target_nick):
     inv.setItem(4, make_player_head(target_nick, u"§c§lПрофиль: §f§l" + target_nick, lore_card))
 
     lore_spec = [
-        u"§7Бесшумный скрытный телепорт (Vanish)",
-        u"§7в GameMode.SPECTATOR за спину игроку.",
-        u"§7Скрывает вас из Tab и пишет фейковый выход!",
+        u"§7Телепорт в GameMode.SPECTATOR",
+        u"§7к выбранному игроку.",
         u"",
         u"§eЛКМ §7— ТП Наблюдателем к " + target_nick,
         u"§a(Для возврата назад введите /xray back)"
     ]
-    inv.setItem(10, make_item(Material.ENDER_EYE, u"§a§lТП Наблюдателем (Vanish)", lore_spec, "spec_player", target_nick))
+    inv.setItem(10, make_item(Material.ENDER_EYE, u"§a§lТП Наблюдателем", lore_spec, "spec_player", target_nick))
 
     lore_inv = [
         u"§7Просмотр инвентаря подозреваемого,",
@@ -554,7 +488,7 @@ def on_inventory_close(event):
 def on_block_place(event):
     block = event.getBlock()
     mat = block.getType()
-    if mat in ORE_WEIGHTS:
+    if mat in ORE_TYPES:
         key = "%s:%d,%d,%d" % (block.getWorld().getName(), block.getX(), block.getY(), block.getZ())
         placed_ores.add(key)
         placed_ores_queue.append(key)
@@ -582,7 +516,7 @@ def on_block_break(event):
     is_nether = (block.getWorld().getEnvironment().name() == "NETHER")
 
     if not is_nether:
-        if y > 64 and mat in ORE_WEIGHTS:
+        if y > 64 and mat in ORE_TYPES:
             return
         if y > 20 and mat in (Material.DIAMOND_ORE, Material.DEEPSLATE_DIAMOND_ORE):
             return
@@ -594,10 +528,7 @@ def on_block_break(event):
         pdata["stone_mined"] = pdata.get("stone_mined", 0) + 1
         return
 
-    if mat in ORE_WEIGHTS:
-        weight = ORE_WEIGHTS[mat]
-        pdata["weighted_score"] = pdata.get("weighted_score", 0) + weight
-
+    if mat in ORE_TYPES:
         mat_name = str(mat.name())
         breakdown = pdata.setdefault("ores_breakdown", {})
         breakdown[mat_name] = breakdown.get(mat_name, 0) + 1
@@ -635,8 +566,6 @@ def on_block_break(event):
         if stone >= MIN_STONE_SAMPLE:
             d_ratio = (pdata.get("diamond_blocks", 0) / float(stone)) * 100.0
             deb_ratio = (pdata.get("debris_blocks", 0) / float(stone)) * 100.0
-            score = pdata.get("weighted_score", 0)
-
             fast_diamond_veins = 0
             fast_debris_veins = 0
             for (t_v, g_v, _, _, _) in hist:
@@ -646,32 +575,23 @@ def on_block_break(event):
                     fast_debris_veins += 1
 
             triggered = False
-            reason = u""
 
             if d_ratio >= ALERT_DIAMOND_RATIO and is_diamond:
                 triggered = True
-                reason = u"Алмазный процент: %.1f%%" % d_ratio
             elif deb_ratio >= ALERT_DEBRIS_RATIO and is_debris:
                 triggered = True
-                reason = u"Незеритовый процент: %.1f%%" % deb_ratio
             elif fast_diamond_veins >= 2 and is_diamond and is_new_vein:
                 triggered = True
-                reason = u"Быстрая добыча: 2 алмазные жилы за <2 мин."
             elif fast_debris_veins >= 2 and is_debris and is_new_vein:
                 triggered = True
-                reason = u"Быстрая добыча: 2 незеритовые жилы за <3 мин."
-            elif score >= ALERT_WEIGHTED_SCORE and (stone % 50 == 0):
-                triggered = True
-                reason = u"Взвешенный балл риска: %d" % score
 
             if triggered:
                 pdata["suspicious"] = True
                 pdata["alarms_count"] = pdata.get("alarms_count", 0) + 1
                 _save()
-                send_clickable_alert(_to_unicode(player.getName()), reason, d_ratio, deb_ratio, score)
 
 # -------------------------------------------------------------------------
-# КОМАНДЫ МОДЕРАЦИИ И СКРЫТЫЙ РЕЖИМ (/xray spec, /xray back)
+# КОМАНДЫ МОДЕРАЦИИ И РЕЖИМ НАБЛЮДАТЕЛЯ (/xray spec, /xray back)
 # -------------------------------------------------------------------------
 def execute_spec(sender, target_nick):
     if not _is_admin(sender):
@@ -684,34 +604,16 @@ def execute_spec(sender, target_nick):
         return
 
     u_admin = uid(sender)
-    spec_back_cache[u_admin] = {
-        "loc": sender.getLocation(),
-        "gamemode": sender.getGameMode()
-    }
+    if u_admin not in spec_back_cache:
+        spec_back_cache[u_admin] = {
+            "loc": sender.getLocation().clone(),
+            "gamemode": sender.getGameMode()
+        }
 
-    # 1. Скрываем модератора от всех обычных игроков (исчезает из Tab и из мира)
-    plugin = get_pyspigot_plugin()
-    for p in Bukkit.getOnlinePlayers():
-        if not _is_admin(p) and p != sender:
-            try:
-                p.hidePlayer(plugin, sender)
-            except TypeError:
-                try:
-                    p.hidePlayer(sender)
-                except Exception:
-                    pass
-
-    # 2. Отправляем фейковое сообщение о выходе из игры всем обычным игрокам
-    fake_leave_msg = u"§e" + _to_unicode(sender.getName()) + u" покинул игру"
-    for p in Bukkit.getOnlinePlayers():
-        if not _is_admin(p):
-            p.sendMessage(fake_leave_msg)
-
-    # 3. Переводим в спек и телепортируем
     sender.setGameMode(GameMode.SPECTATOR)
     sender.teleport(target_player.getLocation())
-    sender.sendMessage(u"§a✓ §7Вы перешли в §aGameMode.SPECTATOR §7к §f" + target_nick + u" §a(Vanish активирован)§7.")
-    sender.sendMessage(u"§7Для возврата на свою точку и выхода из невидимости введите §e/xray back§7.")
+    sender.sendMessage(u"§a✓ §7Вы перешли в §aGameMode.SPECTATOR §7к §f" + target_nick + u"§7.")
+    sender.sendMessage(u"§7Для возврата на исходную точку введите §e/xray back§7.")
 
 def execute_back(sender):
     if not _is_admin(sender):
@@ -722,30 +624,11 @@ def execute_back(sender):
         sender.sendMessage(u"§c✗ §7Сохранённая точка возврата не найдена!")
         return
 
-    # 1. Возвращаем на исходную точку и восстанавливаем игровой режим
+    # Возвращаем на исходную точку и восстанавливаем игровой режим.
     sender.teleport(cache["loc"])
     sender.setGameMode(cache["gamemode"])
     spec_back_cache.pop(u_admin, None)
-
-    # 2. Делаем модератора видимым для всех
-    plugin = get_pyspigot_plugin()
-    for p in Bukkit.getOnlinePlayers():
-        if not _is_admin(p) and p != sender:
-            try:
-                p.showPlayer(plugin, sender)
-            except TypeError:
-                try:
-                    p.showPlayer(sender)
-                except Exception:
-                    pass
-
-    # 3. Отправляем фейковое сообщение о входе в игру
-    fake_join_msg = u"§e" + _to_unicode(sender.getName()) + u" присоединился к игре"
-    for p in Bukkit.getOnlinePlayers():
-        if not _is_admin(p):
-            p.sendMessage(fake_join_msg)
-
-    sender.sendMessage(u"§a✓ §7Вы вернулись на свою точку. Невидимость (Vanish) отключена.")
+    sender.sendMessage(u"§a✓ §7Вы вернулись на исходную точку и в прежний игровой режим.")
 
 def execute_reset(sender, target_nick):
     if not _is_admin(sender):
@@ -760,7 +643,7 @@ def execute_reset(sender, target_nick):
             d["diamond_veins"] = 0
             d["debris_blocks"] = 0
             d["debris_veins"] = 0
-            d["weighted_score"] = 0
+            d.pop("weighted_score", None)
             d["ores_breakdown"] = {}
             vein_history.pop(u_key, None)
             found = True
@@ -781,7 +664,7 @@ def execute_stats(sender, target_nick):
             deb_ratio = (pdata.get("debris_blocks", 0) / float(stone)) * 100.0
             sender.sendMessage(u"§8[XRAY] §7Статистика §f" + target_nick + u"§7:")
             sender.sendMessage(u"  §7Камень: §f%d §8| §7Алмазы: §b%.1f%% §8| §7Незерит: §6%.1f%%" % (stone, d_ratio, deb_ratio))
-            sender.sendMessage(u"  §7Взвешенный балл: §e%d §8| §7Срабатываний: §c%d" % (pdata.get("weighted_score", 0), pdata.get("alarms_count", 0)))
+            sender.sendMessage(u"  §7Срабатываний: §c%d" % pdata.get("alarms_count", 0))
             return
     sender.sendMessage(u"§c✗ §7Игрок §f" + target_nick + u" §7не найден в базе.")
 
@@ -825,7 +708,7 @@ def on_xray_command(sender, label, args):
 
     sender.sendMessage(u"§8[XRAY] §7Команды модератора:")
     sender.sendMessage(u"  §e/xray gui §7— открыть монитор подозреваемых")
-    sender.sendMessage(u"  §e/xray spec <ник> §7— телепорт в спек-режиме (с невидимостью и фейк-выходом)")
+    sender.sendMessage(u"  §e/xray spec <ник> §7— телепорт к игроку в режиме наблюдателя")
     sender.sendMessage(u"  §e/xray back §7— возврат на свою точку из спека")
     sender.sendMessage(u"  §e/xray inv <ник> §7— проверить инвентарь игрока")
     sender.sendMessage(u"  §e/xray reset <ник> §7— обнулить подозрения")
@@ -860,7 +743,7 @@ def on_enable():
         except Exception as ex:
             Bukkit.getLogger().warning("[xray_detector] registerCommand fallback: " + str(ex))
 
-    Bukkit.getLogger().info("[xray_detector] Weighted X-Ray Detector & Vanish Spectator Toolkit loaded.")
+    Bukkit.getLogger().info("[xray_detector] X-Ray monitor and spectator toolkit loaded.")
 
 def on_disable():
     _save()
