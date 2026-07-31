@@ -5,7 +5,9 @@ PySpigot Casino - ДИНАМИЧЕСКИЙ ДЖЕКПОТ И ПРИЯТНЫЕ З
 ===============================================================================
 Команды казино:
   /casino <сумма> — Играть в слоты казино
+  /casino history — Последние ставки казино
   /jackpot, /casinobank — Просмотреть текущий банк джекпота
+  /jackpot history — Последние победители джекпота
   /opjackpot [сумма] — Тестовый 100% ДЖЕКПОТ (Только для /op)
 ===============================================================================
 """
@@ -13,6 +15,7 @@ PySpigot Casino - ДИНАМИЧЕСКИЙ ДЖЕКПОТ И ПРИЯТНЫЕ З
 import os
 import sys
 import json
+import io
 import time
 import re
 import random
@@ -35,13 +38,28 @@ except Exception:
 # ИМПОРТ BUKKIT / PYSPIGOT / JAVA ARRAYLIST
 # -----------------------------------------------------------------------------
 try:
-    from org.bukkit import Bukkit, ChatColor, Sound
+    from org.bukkit import Bukkit, ChatColor, Sound, Material
+    from org.bukkit.entity import Player
     from org.bukkit.command import Command, TabCompleter
+    from org.bukkit.inventory import ItemStack, InventoryHolder
+    from org.bukkit.event import Listener, EventPriority, HandlerList
+    from org.bukkit.plugin import EventExecutor
+    from org.bukkit.event.inventory import InventoryClickEvent, InventoryDragEvent
     BUKKIT_AVAILABLE = True
 except ImportError:
     BUKKIT_AVAILABLE = False
     Command = object
     TabCompleter = object
+    Player = object
+    InventoryHolder = object
+    ItemStack = None
+    Material = None
+    Listener = object
+    EventPriority = None
+    HandlerList = None
+    EventExecutor = object
+    InventoryClickEvent = None
+    InventoryDragEvent = None
 
 try:
     from java.lang import String as JavaString, StringBuilder, Runnable, System, Throwable
@@ -84,7 +102,7 @@ def get_script_dir():
 # -----------------------------------------------------------------------------
 class CasinoConfig:
     PLUGIN_NAME = u"SmartY-Casino"
-    VERSION = u"2.4.0"
+    VERSION = u"2.5.0"
 
     MIN_CASINO_BET = 10.0
     BASE_JACKPOT = 1000.0
@@ -104,6 +122,8 @@ class CasinoConfig:
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
     DATA_FILE = os.path.join(DATA_DIR, "economy.json")
+    HISTORY_FILE = os.path.join(DATA_DIR, "casino_history.json")
+    HISTORY_LIMIT = 9
 
     MESSAGES = {
         "casino_usage": u"{prefix}&c\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u0438\u0435: &f/casino <\u0441\u0443\u043c\u043c\u043e>",
@@ -125,6 +145,15 @@ class CasinoConfig:
 
 SLOT_SYMBOLS = [u"7", u"\u2666", u"\u2605", u"\u2606", u"\u25c6"]
 active_casino_players = set()
+active_casino_spin_runners = {}
+
+casino_history_state = {
+    "schema_version": 1,
+    "attempt_since_jackpot": 0,
+    "jackpots": [],
+    "bets": []
+}
+registered_casino_listeners = []
 
 
 # -----------------------------------------------------------------------------
@@ -378,6 +407,181 @@ def _safe_float(value, default=0.0):
     return val
 
 
+# -----------------------------------------------------------------------------
+# ПЕРСИСТЕНТНАЯ ИСТОРИЯ СТАВОК И ДЖЕКПОТОВ
+# -----------------------------------------------------------------------------
+def _new_history_state():
+    return {
+        "schema_version": 1,
+        "attempt_since_jackpot": 0,
+        "jackpots": [],
+        "bets": []
+    }
+
+
+def _safe_nonnegative_int(value, default=0):
+    try:
+        return max(0, int(value))
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def _normalize_history_entry(raw, jackpot_entry=False):
+    if not isinstance(raw, dict):
+        return None
+
+    player_name = to_unicode(raw.get("player_name", u"Unknown")).strip()
+    if not player_name:
+        player_name = u"Unknown"
+    player_uuid = to_unicode(raw.get("player_uuid", u"")).strip()
+    outcome = to_unicode(raw.get("outcome", u"JACKPOT" if jackpot_entry else u"LOSE")).upper()
+    if outcome not in (u"LOSE", u"WIN", u"JACKPOT"):
+        outcome = u"JACKPOT" if jackpot_entry else u"LOSE"
+
+    return {
+        "player_uuid": player_uuid,
+        "player_name": player_name[:32],
+        "bet": round(max(0.0, _safe_float(raw.get("bet", 0.0), 0.0)), 2),
+        "payout": round(max(0.0, _safe_float(raw.get("payout", 0.0), 0.0)), 2),
+        "multiplier": round(max(0.0, _safe_float(raw.get("multiplier", 0.0), 0.0)), 2),
+        "outcome": outcome,
+        "attempt": max(1, _safe_nonnegative_int(raw.get("attempt", 1), 1)),
+        "timestamp": max(0, _safe_nonnegative_int(raw.get("timestamp", 0), 0))
+    }
+
+
+def save_casino_history():
+    """Атомарно сохраняет обе истории и текущий номер попытки."""
+    try:
+        if not os.path.exists(CasinoConfig.DATA_DIR):
+            os.makedirs(CasinoConfig.DATA_DIR)
+
+        payload = {
+            "schema_version": 1,
+            "attempt_since_jackpot": _safe_nonnegative_int(
+                casino_history_state.get("attempt_since_jackpot", 0), 0
+            ),
+            "jackpots": list(casino_history_state.get("jackpots", []))[-CasinoConfig.HISTORY_LIMIT:],
+            "bets": list(casino_history_state.get("bets", []))[-CasinoConfig.HISTORY_LIMIT:]
+        }
+        casino_history_state.update(payload)
+
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        if not isinstance(encoded, unicode):
+            encoded = encoded.decode("utf-8", "replace")
+
+        temp_path = CasinoConfig.HISTORY_FILE + ".tmp"
+        handle = io.open(temp_path, "w", encoding="utf-8")
+        try:
+            handle.write(encoded)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        finally:
+            handle.close()
+
+        if hasattr(os, "replace"):
+            os.replace(temp_path, CasinoConfig.HISTORY_FILE)
+        else:
+            # На Linux os.rename поверх существующего файла атомарен. Удаление
+            # назначения заранее оставило бы короткое окно без файла истории.
+            try:
+                os.rename(temp_path, CasinoConfig.HISTORY_FILE)
+            except OSError:
+                if os.path.exists(CasinoConfig.HISTORY_FILE):
+                    os.remove(CasinoConfig.HISTORY_FILE)
+                os.rename(temp_path, CasinoConfig.HISTORY_FILE)
+        return True
+    except Exception as exc:
+        log_error(u"Error saving casino_history.json: {0}".format(exc))
+        return False
+
+
+def load_casino_history():
+    global casino_history_state
+    casino_history_state = _new_history_state()
+
+    if not os.path.exists(CasinoConfig.HISTORY_FILE):
+        save_casino_history()
+        return
+
+    try:
+        handle = io.open(CasinoConfig.HISTORY_FILE, "r", encoding="utf-8")
+        try:
+            loaded = json.loads(handle.read())
+        finally:
+            handle.close()
+        if not isinstance(loaded, dict):
+            raise ValueError("history root must be an object")
+
+        normalized = _new_history_state()
+        normalized["attempt_since_jackpot"] = _safe_nonnegative_int(
+            loaded.get("attempt_since_jackpot", 0), 0
+        )
+
+        raw_jackpots = loaded.get("jackpots", [])
+        raw_bets = loaded.get("bets", [])
+        if not isinstance(raw_jackpots, list):
+            raw_jackpots = []
+        if not isinstance(raw_bets, list):
+            raw_bets = []
+
+        for raw in raw_jackpots[-CasinoConfig.HISTORY_LIMIT:]:
+            entry = _normalize_history_entry(raw, True)
+            if entry is not None:
+                normalized["jackpots"].append(entry)
+        for raw in raw_bets[-CasinoConfig.HISTORY_LIMIT:]:
+            entry = _normalize_history_entry(raw, False)
+            if entry is not None:
+                normalized["bets"].append(entry)
+
+        casino_history_state = normalized
+        # Перезаписываем нормализованный формат и одновременно убираем лишние записи.
+        save_casino_history()
+    except Exception as exc:
+        corrupt_path = CasinoConfig.HISTORY_FILE + ".corrupt-" + str(int(time.time()))
+        try:
+            os.rename(CasinoConfig.HISTORY_FILE, corrupt_path)
+            log_error(u"Damaged casino history moved to {0}".format(corrupt_path))
+        except Exception:
+            pass
+        log_error(u"Error loading casino_history.json: {0}".format(exc))
+        casino_history_state = _new_history_state()
+        save_casino_history()
+
+
+def record_casino_result(player_uuid, player_name, bet, outcome, multiplier, payout):
+    """Добавляет завершённую реальную ставку и возвращает её номер попытки."""
+    attempt = _safe_nonnegative_int(casino_history_state.get("attempt_since_jackpot", 0), 0) + 1
+    entry = _normalize_history_entry({
+        "player_uuid": player_uuid or u"",
+        "player_name": player_name,
+        "bet": bet,
+        "payout": payout,
+        "multiplier": multiplier,
+        "outcome": outcome,
+        "attempt": attempt,
+        "timestamp": int(time.time())
+    }, outcome == "JACKPOT")
+
+    bets = casino_history_state.setdefault("bets", [])
+    bets.append(entry)
+    casino_history_state["bets"] = bets[-CasinoConfig.HISTORY_LIMIT:]
+
+    if outcome == "JACKPOT":
+        jackpots = casino_history_state.setdefault("jackpots", [])
+        jackpots.append(dict(entry))
+        casino_history_state["jackpots"] = jackpots[-CasinoConfig.HISTORY_LIMIT:]
+        casino_history_state["attempt_since_jackpot"] = 0
+    else:
+        casino_history_state["attempt_since_jackpot"] = attempt
+
+    save_casino_history()
+    return attempt
+
+
 class CasinoAccountManager(object):
     """Менеджер счетов казино, работающий напрямую через общий EconomyManager."""
     def __init__(self):
@@ -582,48 +786,198 @@ def get_pyspigot_plugin():
 
 
 # -----------------------------------------------------------------------------
+# GUI ИСТОРИИ: ОДНА СТРОКА, ДЕВЯТЬ ПОСЛЕДНИХ ЗАПИСЕЙ
+# -----------------------------------------------------------------------------
+class CasinoHistoryHolder(InventoryHolder):
+    def __init__(self, history_kind):
+        self.history_kind = history_kind
+        self.inventory = None
+
+    def getInventory(self):
+        return self.inventory
+
+
+def _format_history_time(timestamp):
+    try:
+        if int(timestamp) <= 0:
+            return u"Неизвестно"
+        return to_unicode(time.strftime("%d.%m.%Y %H:%M", time.localtime(int(timestamp))))
+    except Exception:
+        return u"Неизвестно"
+
+
+def _set_history_head_owner(meta, entry):
+    player_uuid = to_unicode(entry.get("player_uuid", u""))
+    player_name = to_unicode(entry.get("player_name", u"Unknown"))
+    if player_uuid and JavaUUID is not None and hasattr(meta, "setOwningPlayer"):
+        try:
+            offline_player = Bukkit.getOfflinePlayer(JavaUUID.fromString(str(player_uuid)))
+            meta.setOwningPlayer(offline_player)
+            return
+        except Exception:
+            pass
+    if hasattr(meta, "setOwner"):
+        try:
+            meta.setOwner(to_java_string(player_name))
+        except Exception:
+            pass
+
+
+def _make_history_head(entry, history_kind):
+    item = ItemStack(Material.PLAYER_HEAD, 1)
+    meta = item.getItemMeta()
+    player_name = to_unicode(entry.get("player_name", u"Unknown"))
+    bet = _safe_float(entry.get("bet", 0.0), 0.0)
+    payout = _safe_float(entry.get("payout", 0.0), 0.0)
+    multiplier = _safe_float(entry.get("multiplier", 0.0), 0.0)
+    attempt = max(1, _safe_nonnegative_int(entry.get("attempt", 1), 1))
+
+    if history_kind == "jackpot":
+        display_name = u"&6&l★ &f" + player_name
+        lore = [
+            u"&7Забрал джекпот: &a" + format_currency(payout),
+            u"&7Ставка: &e" + format_currency(bet),
+            u"&7Джекпот выпал с попытки: &f#" + str(attempt),
+            u"&8" + _format_history_time(entry.get("timestamp", 0))
+        ]
+    else:
+        outcome = to_unicode(entry.get("outcome", u"LOSE")).upper()
+        if outcome == u"JACKPOT":
+            display_name = u"&6&lДЖЕКПОТ &8• &f" + player_name
+            result_line = u"&7Результат: &6Джекпот"
+        elif outcome == u"WIN":
+            display_name = u"&aВыигрыш &8• &f" + player_name
+            result_line = u"&7Результат: &aВыигрыш x" + to_unicode("{:g}".format(multiplier))
+        else:
+            display_name = u"&cПроигрыш &8• &f" + player_name
+            result_line = u"&7Результат: &cПроигрыш"
+
+        net_result = round(payout - bet, 2)
+        net_prefix = u"+" if net_result > 0 else u""
+        net_color = u"&a" if net_result > 0 else (u"&c" if net_result < 0 else u"&7")
+        lore = [
+            u"&7Ставка: &e" + format_currency(bet),
+            result_line,
+            u"&7Выплата: &a" + format_currency(payout),
+            u"&7Итог: " + net_color + net_prefix + format_currency(net_result),
+            u"&7Попытка после джекпота: &f#" + str(attempt),
+            u"&8" + _format_history_time(entry.get("timestamp", 0))
+        ]
+
+    if meta is not None:
+        meta.setDisplayName(to_java_string(colorize(display_name)))
+        meta.setLore(build_java_list([colorize(line) for line in lore]))
+        _set_history_head_owner(meta, entry)
+        item.setItemMeta(meta)
+    return item
+
+
+def open_casino_history_gui(sender, history_kind):
+    if not BUKKIT_AVAILABLE or not hasattr(sender, "openInventory") or not hasattr(sender, "getUniqueId"):
+        send_casino_msg(sender, u"{prefix}&cИсторию можно открыть только в игре.")
+        return False
+
+    if history_kind == "jackpot":
+        title = u"&8История джекпотов"
+        records = list(casino_history_state.get("jackpots", []))[-CasinoConfig.HISTORY_LIMIT:]
+        empty_name = u"&7Джекпотов пока не было"
+    else:
+        title = u"&8История ставок"
+        records = list(casino_history_state.get("bets", []))[-CasinoConfig.HISTORY_LIMIT:]
+        empty_name = u"&7Ставок пока не было"
+
+    holder = CasinoHistoryHolder(history_kind)
+    inventory = Bukkit.createInventory(holder, 9, to_java_string(colorize(title)))
+    holder.inventory = inventory
+
+    for slot, entry in enumerate(reversed(records)):
+        inventory.setItem(slot, _make_history_head(entry, history_kind))
+
+    if not records:
+        empty_item = ItemStack(Material.GRAY_STAINED_GLASS_PANE, 1)
+        empty_meta = empty_item.getItemMeta()
+        if empty_meta is not None:
+            empty_meta.setDisplayName(to_java_string(colorize(empty_name)))
+            empty_item.setItemMeta(empty_meta)
+        inventory.setItem(4, empty_item)
+
+    sender.openInventory(inventory)
+    safe_play_sound(sender, ["BLOCK_CHEST_OPEN", "CHEST_OPEN"], 0.7, 1.1)
+    return True
+
+
+def on_casino_history_click(event):
+    try:
+        view = event.getView()
+        top_inventory = view.getTopInventory() if view is not None else None
+        holder = top_inventory.getHolder() if top_inventory is not None else None
+        if holder is not None and isinstance(holder, CasinoHistoryHolder):
+            # Отменяем клики и shift-клики в обоих инвентарях, пока открыта история.
+            event.setCancelled(True)
+    except Exception as exc:
+        log_error(u"Casino history click error: {0}".format(exc))
+
+
+def on_casino_history_drag(event):
+    try:
+        view = event.getView()
+        top_inventory = view.getTopInventory() if view is not None else None
+        holder = top_inventory.getHolder() if top_inventory is not None else None
+        if holder is not None and isinstance(holder, CasinoHistoryHolder):
+            event.setCancelled(True)
+    except Exception as exc:
+        log_error(u"Casino history drag error: {0}".format(exc))
+
+
+# -----------------------------------------------------------------------------
 # ЛОГИКА АНИМАЦИИ СЛОТОВ И ИТОГОВ ИГРЫ
 # -----------------------------------------------------------------------------
-def finish_casino_game(player, bet, outcome, multiplier, payout, final_symbols, reset_bank=True):
+def finish_casino_game(player, bet, outcome, multiplier, payout, final_symbols, reset_bank=True, announce=True):
     player_uuid, player_name = get_sender_uuid_and_name(player)
     manager = CasinoAccountManager()
+    player_online = announce and player is not None and (not hasattr(player, "isOnline") or player.isOnline())
 
     if player_uuid:
         active_casino_players.discard(player_uuid)
 
     if outcome == "LOSE":
         manager.add_to_jackpot(bet)
-        safe_play_sound(player, ["BLOCK_NOTE_BLOCK_PLING", "NOTE_PLING"], 1.0, 0.6)
-        send_casino_msg(player, "casino_lose", formatted_amount=format_currency(bet))
+        if player_online:
+            safe_play_sound(player, ["BLOCK_NOTE_BLOCK_PLING", "NOTE_PLING"], 1.0, 0.6)
+            send_casino_msg(player, "casino_lose", formatted_amount=format_currency(bet))
 
     elif outcome == "WIN":
         if player_uuid:
             manager.modify_balance(player_uuid, payout, player_name)  # выигрыш всегда начисляется (deposit всегда успешен)
-        safe_play_sound(player, ["BLOCK_NOTE_BLOCK_PLING", "NOTE_PLING"], 1.0, 1.4)
-        send_casino_msg(player, "casino_win", formatted_amount=format_currency(payout), mult=multiplier)
+        if player_online:
+            safe_play_sound(player, ["BLOCK_NOTE_BLOCK_PLING", "NOTE_PLING"], 1.0, 1.4)
+            send_casino_msg(player, "casino_win", formatted_amount=format_currency(payout), mult=multiplier)
 
     elif outcome == "JACKPOT":
         if player_uuid:
             manager.modify_balance(player_uuid, payout, player_name)
 
-        # 1. Торжественные звуки
-        play_sound_all(["UI_TOAST_CHALLENGE_COMPLETE", "ENTITY_FIREWORK_ROCKET_LARGE_BLAST"], 1.0, 1.0)
+        if announce:
+            # Глобальное объявление сохраняется, даже если победитель вышел во время анимации.
+            play_sound_all(["UI_TOAST_CHALLENGE_COMPLETE", "ENTITY_FIREWORK_ROCKET_LARGE_BLAST"], 1.0, 1.0)
+            if player_online:
+                spawn_jackpot_celebration_effects(player)
+            t_title = CasinoConfig.MESSAGES["jackpot_title"]
+            t_sub = CasinoConfig.MESSAGES["jackpot_subtitle"].format(player=player_name, formatted_amount=format_currency(payout))
+            send_title_all(t_title, t_sub, 10, 80, 20)
+            broadcast_casino_msg("casino_jackpot_broadcast", player=player_name, formatted_amount=format_currency(payout))
+        if player_online:
+            send_casino_msg(player, "casino_jackpot_win", formatted_amount=format_currency(payout))
 
-        # 2. Визуал-эффекты
-        spawn_jackpot_celebration_effects(player)
-
-        # 3. Неназойливый заголовок
-        t_title = CasinoConfig.MESSAGES["jackpot_title"]
-        t_sub = CasinoConfig.MESSAGES["jackpot_subtitle"].format(player=player_name, formatted_amount=format_currency(payout))
-        send_title_all(t_title, t_sub, 10, 80, 20)
-
-        # 4. Рассылка в чат
-        broadcast_casino_msg("casino_jackpot_broadcast", player=player_name, formatted_amount=format_currency(payout))
-        send_casino_msg(player, "casino_jackpot_win", formatted_amount=format_currency(payout))
+    # reset_bank=False используется исключительно тестовым /opjackpot: он не
+    # является реальной оплаченной ставкой и не влияет на историю/номер попытки.
+    if reset_bank:
+        record_casino_result(player_uuid, player_name, bet, outcome, multiplier, payout)
 
     # Вывод ТОЧНОГО обновленного баланса после игры
-    new_balance = manager.get_balance(player_uuid) if player_uuid else 0.0
-    send_casino_msg(player, "casino_balance_after", formatted_balance=format_currency(new_balance))
+    if player_online:
+        new_balance = manager.get_balance(player_uuid) if player_uuid else 0.0
+        send_casino_msg(player, "casino_balance_after", formatted_balance=format_currency(new_balance))
 
 
 def start_slot_animation(player, bet, force_jackpot=False, reset_bank=True):
@@ -696,16 +1050,28 @@ def start_slot_animation(player, bet, force_jackpot=False, reset_bank=True):
         def __init__(self):
             self.step = 0
             self.task_id = -1
+            self.finished = False
+
+        def complete(self, announce=True):
+            if self.finished:
+                return
+            self.finished = True
+            if self.task_id != -1:
+                Bukkit.getScheduler().cancelTask(self.task_id)
+            if player_uuid and active_casino_spin_runners.get(player_uuid) is self:
+                active_casino_spin_runners.pop(player_uuid, None)
+            finish_casino_game(player, bet, outcome, multiplier, payout, final_symbols, reset_bank, announce)
 
         def run(self):
             try:
+                if self.finished:
+                    return
                 self.step += 1
 
                 if not player.isOnline():
-                    if self.task_id != -1:
-                        Bukkit.getScheduler().cancelTask(self.task_id)
-                    if player_uuid:
-                        active_casino_players.discard(player_uuid)
+                    # Ставка уже списана, поэтому результат обязан завершиться и
+                    # сохраниться, даже если игрок вышел во время прокрутки.
+                    self.complete()
                     return
 
                 # ПРИЯТНЫЕ ЗВУКИ НОТНОГО БЛОКА (BLOCK_NOTE_BLOCK_PLING)
@@ -742,21 +1108,19 @@ def start_slot_animation(player, bet, force_jackpot=False, reset_bank=True):
 
                 # Шаг 10: Торжественный замер символов перед выплатным таском
                 elif self.step >= 10:
-                    if self.task_id != -1:
-                        Bukkit.getScheduler().cancelTask(self.task_id)
-                    finish_casino_game(player, bet, outcome, multiplier, payout, final_symbols, reset_bank)
+                    self.complete()
 
             except Exception as e:
                 log_error(u"Error in SpinRunnable: {0}".format(e))
-                if self.task_id != -1:
-                    Bukkit.getScheduler().cancelTask(self.task_id)
-                if player_uuid:
-                    active_casino_players.discard(player_uuid)
+                # Ошибка визуальной анимации не должна отнимать ставку или результат.
+                self.complete()
 
     runner = SpinRunnable()
     try:
         task_obj = Bukkit.getScheduler().runTaskTimer(plugin, runner, 0, 3)
         runner.task_id = task_obj.getTaskId()
+        if player_uuid:
+            active_casino_spin_runners[player_uuid] = runner
     except Exception as e:
         log_error(u"Could not start runTaskTimer in casino: {0}".format(e))
         finish_casino_game(player, bet, outcome, multiplier, payout, final_symbols, reset_bank)
@@ -783,6 +1147,10 @@ def cmd_casino(*args):
     sender, cmd_args = parse_cmd_args(*args)
     manager = CasinoAccountManager()
 
+    if len(cmd_args) >= 1 and to_unicode(cmd_args[0]).lower() == u"history":
+        open_casino_history_gui(sender, "bets")
+        return True
+
     uuid_str, name = get_sender_uuid_and_name(sender)
     if not uuid_str and (name == u"Console" or name == u"Unknown"):
         send_casino_msg(sender, "no_permission")
@@ -790,6 +1158,7 @@ def cmd_casino(*args):
 
     if len(cmd_args) < 1:
         send_casino_msg(sender, "casino_usage")
+        send_casino_msg(sender, u"{prefix}&7История последних ставок: &f/casino history")
         return True
 
     try:
@@ -827,6 +1196,10 @@ def cmd_jackpot(*args):
     Просмотр банка джекпота для всех игроков.
     """
     sender, cmd_args = parse_cmd_args(*args)
+    if len(cmd_args) >= 1 and to_unicode(cmd_args[0]).lower() == u"history":
+        open_casino_history_gui(sender, "jackpot")
+        return True
+
     manager = CasinoAccountManager()
     send_casino_msg(sender, "jackpot_info", formatted_amount=format_currency(manager.jackpot_bank))
     return True
@@ -877,8 +1250,16 @@ def tab_casino(*args):
 
     if len(cmd_args) <= 1:
         prefix = cmd_args[0].lower() if len(cmd_args) == 1 else ""
-        bets = ["10", "50", "100", "250", "500", "1000"]
+        bets = ["history", "10", "50", "100", "250", "500", "1000"]
         return build_java_list([b for b in bets if b.startswith(prefix)])
+    return build_java_list([])
+
+
+def tab_jackpot(*args):
+    cmd_args = get_cmd_args_from_args(args)
+    if len(cmd_args) <= 1:
+        prefix = cmd_args[0].lower() if len(cmd_args) == 1 else ""
+        return build_java_list([u"history"] if u"history".startswith(prefix) else [])
     return build_java_list([])
 
 
@@ -954,6 +1335,49 @@ def get_pyspigot_mgr(name):
     except Exception:
         pass
     return None
+
+
+def register_casino_event(event_class, handler_func):
+    if not BUKKIT_AVAILABLE or event_class is None:
+        return False
+    plugin = get_pyspigot_plugin()
+    if not plugin:
+        return False
+
+    try:
+        class CasinoDirectListener(Listener):
+            pass
+
+        class CasinoEventExecutor(EventExecutor):
+            def execute(self, listener, event):
+                try:
+                    handler_func(event)
+                except Exception as exc:
+                    log_error(u"Casino event handler error: {0}".format(exc))
+
+        listener = CasinoDirectListener()
+        Bukkit.getPluginManager().registerEvent(
+            event_class,
+            listener,
+            EventPriority.HIGHEST,
+            CasinoEventExecutor(),
+            plugin
+        )
+        registered_casino_listeners.append(listener)
+        return True
+    except Exception as exc:
+        log_error(u"Cannot register casino event: {0}".format(exc))
+        return False
+
+
+def unregister_casino_events():
+    if HandlerList is not None:
+        for listener in list(registered_casino_listeners):
+            try:
+                HandlerList.unregisterAll(listener)
+            except Exception:
+                pass
+    del registered_casino_listeners[:]
 
 
 def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
@@ -1094,7 +1518,7 @@ def unregister_casino_commands():
 def register_casino_commands():
     commands_def = [
         ("casino", "Play casino slot machine", "/casino <bet>", [], cmd_casino, tab_casino),
-        ("jackpot", "Check casino jackpot pool", "/jackpot", ["casinobank"], cmd_jackpot, None),
+        ("jackpot", "Check casino jackpot pool", "/jackpot [history]", ["casinobank"], cmd_jackpot, tab_jackpot),
         ("opjackpot", "OP test 100% jackpot spin", "/opjackpot [bet]", ["adminjackpot", "jackpotwin"], cmd_opjackpot, tab_opjackpot),
     ]
 
@@ -1123,7 +1547,7 @@ def register_casino_commands():
         force_register_bukkit_command("pyspigot-casino", cmd_obj, aliases)
         registered_casino_commands.append((name, aliases))
 
-    log_info(u"Casino commands force-registered in Bukkit CommandMap (/casino, /jackpot, /opjackpot) with TabCompletion.")
+    log_info(u"Casino commands force-registered (/casino, /jackpot, /opjackpot) with history completion.")
     sync_player_commands()
 
 
@@ -1133,8 +1557,18 @@ def register_casino_commands():
 def on_enable():
     log_info(u"=== Starting {0} v{1} ===".format(CasinoConfig.PLUGIN_NAME, CasinoConfig.VERSION))
     try:
+        # Повторный reload не должен оставлять старые команды или GUI-listeners.
+        unregister_casino_events()
+        unregister_casino_commands()
+        load_casino_history()
+        register_casino_event(InventoryClickEvent, on_casino_history_click)
+        register_casino_event(InventoryDragEvent, on_casino_history_drag)
         register_casino_commands()
-        log_info(u"{0} successfully enabled!".format(CasinoConfig.PLUGIN_NAME))
+        log_info(u"{0} successfully enabled; history loaded ({1} bets, {2} jackpots).".format(
+            CasinoConfig.PLUGIN_NAME,
+            len(casino_history_state.get("bets", [])),
+            len(casino_history_state.get("jackpots", []))
+        ))
     except Exception as e:
         log_error(u"Critical error in casino on_enable: {0}".format(e))
         import traceback
@@ -1143,6 +1577,17 @@ def on_enable():
 
 def on_disable():
     log_info(u"=== Disabling {0} ===".format(CasinoConfig.PLUGIN_NAME))
+    # Прямые Bukkit-задачи принадлежат PySpigot как Java-плагину и могут пережить
+    # reload скрипта. Завершаем их один раз без визуальных объявлений.
+    for runner in list(active_casino_spin_runners.values()):
+        try:
+            runner.complete(False)
+        except Exception as exc:
+            log_error(u"Cannot finish active casino spin during unload: {0}".format(exc))
+    active_casino_spin_runners.clear()
+    active_casino_players.clear()
+    save_casino_history()
+    unregister_casino_events()
     unregister_casino_commands()
 
 
