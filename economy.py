@@ -243,7 +243,7 @@ def safe_amount(amount, default=0.0):
 # -----------------------------------------------------------------------------
 class EconomyConfig:
     PLUGIN_NAME = u"SmartY-Economy"
-    VERSION = u"3.4.0"
+    VERSION = u"3.5.0"
     PREFIX = u"&a&l[\u042d\u043a\u043e\u043d\u043e\u043c\u0438\u043a\u0430]&r "
 
     DEFAULT_BALANCE = 100.0
@@ -1229,9 +1229,9 @@ def update_balance_hud(player):
 
 class PaydayRunnable(Runnable):
     def run(self):
+        now = time.time()
         try:
             eco = EconomyManager()
-            now = time.time()
 
             for p in Bukkit.getOnlinePlayers():
                 if p and p.isOnline():
@@ -1240,6 +1240,13 @@ class PaydayRunnable(Runnable):
 
         except Exception as e:
             log_error(u"Error in PaydayRunnable: {0}".format(e))
+
+        # Heartbeat ограничивает ошибку last-seen примерно одной минутой даже
+        # после аварийного завершения, когда PlayerQuitEvent/on_disable не успели.
+        try:
+            checkpoint_online_last_seen(now)
+        except Exception as e:
+            log_error(u"Error in last-seen heartbeat: {0}".format(e))
 
 
 class HudRunnable(Runnable):
@@ -1572,9 +1579,20 @@ class LastSeenManager(object):
             temp_file = self.file_path + ".tmp"
             with open(temp_file, "w") as f:
                 json.dump(self.data, f, indent=2)
-            if os.path.exists(self.file_path):
-                os.remove(self.file_path)
-            os.rename(temp_file, self.file_path)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            if hasattr(os, "replace"):
+                os.replace(temp_file, self.file_path)
+            else:
+                try:
+                    os.rename(temp_file, self.file_path)
+                except OSError:
+                    if os.path.exists(self.file_path):
+                        os.remove(self.file_path)
+                    os.rename(temp_file, self.file_path)
         except Exception as e:
             log_error(u"Error saving last_seen.json: {0}".format(e))
 
@@ -1582,8 +1600,54 @@ class LastSeenManager(object):
         return self.data.get(str(uuid_str))
 
     def update_last_seen(self, uuid_str):
-        self.data[str(uuid_str)] = time.time()
-        self.save_data()
+        return self.update_many([uuid_str])
+
+    def update_many(self, uuid_values, timestamp=None):
+        """Обновляет несколько игроков одной атомарной записью файла."""
+        if timestamp is None:
+            timestamp = time.time()
+        try:
+            timestamp = float(timestamp)
+        except (ValueError, TypeError, OverflowError):
+            timestamp = time.time()
+        if timestamp != timestamp or timestamp in (float("inf"), float("-inf")):
+            timestamp = time.time()
+
+        updated = 0
+        for uuid_value in uuid_values:
+            if uuid_value is None:
+                continue
+            uuid_key = str(uuid_value).strip()
+            if not uuid_key:
+                continue
+            self.data[uuid_key] = timestamp
+            updated += 1
+
+        if updated > 0:
+            self.save_data()
+        return updated
+
+
+def checkpoint_online_last_seen(timestamp=None):
+    """Пакетно фиксирует, что текущие онлайн-игроки были на сервере в этот момент."""
+    if not BUKKIT_AVAILABLE:
+        return 0
+    if timestamp is None:
+        timestamp = time.time()
+
+    online_uuids = []
+    try:
+        for player in Bukkit.getOnlinePlayers():
+            if player is None:
+                continue
+            uuid_str, _ = get_sender_uuid_and_name(player)
+            if uuid_str:
+                online_uuids.append(uuid_str)
+    except Exception as e:
+        log_error(u"Error collecting online players for last-seen checkpoint: {0}".format(e))
+        return 0
+
+    return LastSeenManager().update_many(online_uuids, timestamp)
 
 
 def safe_play_sound(player, sound_candidates, volume=1.0, pitch=1.0):
@@ -2408,6 +2472,9 @@ def on_enable():
             if InventoryClickEvent is not None:
                 register_event_directly(InventoryClickEvent, on_player_activity)
             log_info(u"Economy events registered directly into Bukkit EventMap.")
+            # При /ps reload игроки не получают новый PlayerJoinEvent. Фиксируем,
+            # что они уже онлайн, чтобы будущий рестарт не считал время от старого входа.
+            checkpoint_online_last_seen(time.time())
 
         register_economy_commands()
         reset_online_payday_checks()
@@ -2423,17 +2490,23 @@ def on_enable():
 
 def on_disable():
     log_info(u"=== Disabling {0} ===".format(EconomyConfig.PLUGIN_NAME))
+    shutdown_timestamp = time.time()
     stop_hud_timer()
     stop_afk_timer()
     stop_payday_timer()
+    # На остановке сервера PlayerQuitEvent может не дойти до PySpigot-скрипта.
+    # Сохраняем всех, кого Bukkit ещё считает подключёнными, одним JSON-write.
+    try:
+        checkpoint_online_last_seen(shutdown_timestamp)
+    except Exception as e:
+        log_error(u"Error saving online last-seen values during shutdown: {0}".format(e))
     unregister_script_listeners()
     unregister_economy_commands()
     try:
         economy = EconomyManager()
         if BUKKIT_AVAILABLE:
-            now = time.time()
             for player in Bukkit.getOnlinePlayers():
-                process_player_payday(economy, player, now, False)
+                process_player_payday(economy, player, shutdown_timestamp, False)
         economy.save_database()
     except Exception:
         pass
