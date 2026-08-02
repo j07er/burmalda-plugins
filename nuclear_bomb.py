@@ -16,6 +16,8 @@ Commands:
 """
 
 import math
+import json
+import os
 import random
 import re
 import sys
@@ -50,7 +52,7 @@ try:
     from org.bukkit.event import EventPriority, HandlerList, Listener
     from org.bukkit.event.block import BlockPlaceEvent
     from org.bukkit.event.inventory import CraftItemEvent
-    from org.bukkit.event.player import PlayerDropItemEvent, PlayerJoinEvent
+    from org.bukkit.event.player import PlayerDropItemEvent, PlayerJoinEvent, PlayerQuitEvent
     from org.bukkit.inventory import ItemFlag, ItemStack, RecipeChoice, ShapedRecipe
     from org.bukkit.persistence import PersistentDataType
     from org.bukkit.plugin import EventExecutor
@@ -82,6 +84,7 @@ except ImportError:
     CraftItemEvent = None
     PlayerDropItemEvent = None
     PlayerJoinEvent = None
+    PlayerQuitEvent = None
     ItemFlag = None
     ItemStack = None
     RecipeChoice = None
@@ -103,9 +106,22 @@ except ImportError:
     BUKKIT_AVAILABLE = False
 
 
+def get_script_dir():
+    if "__file__" in globals() and __file__:
+        try:
+            return os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            pass
+    cwd = os.getcwd()
+    pyspigot_path = os.path.join(cwd, "plugins", "PySpigot", "scripts")
+    if os.path.exists(pyspigot_path):
+        return pyspigot_path
+    return cwd
+
+
 class NukeConfig(object):
     PLUGIN_NAME = u"SmartY-Nuclear"
-    VERSION = u"1.1.0"
+    VERSION = u"1.2.0"
     PREFIX = u"&8[&c☢&8] &r"
 
     MIN_DROP_HEIGHT = 18
@@ -117,6 +133,9 @@ class NukeConfig(object):
     TELEPORT_LOCK_FAILSAFE_SECONDS = 15 * 60
     TELEPORT_LOCK_AFTER_DETONATION_SECONDS = 5
     TELEPORT_LOCK_PROPERTY = "SmartY_NuclearTeleportLockUntil"
+    LOGOUT_DEATHS_FILE = os.path.join(
+        get_script_dir(), "data", "nuclear_logout_deaths.json"
+    )
 
     EXPLOSION_POWER = 144.0
     BLOCK_EXPLOSION_POWER = 16.0
@@ -169,6 +188,8 @@ particle_cache = {}
 missing_advancement_warnings = set()
 last_launch_ms = 0
 post_detonation_lock_until_ms = 0
+logout_death_state = {"schema_version": 1, "players": {}}
+recent_detonation_zones = []
 initialized = False
 
 
@@ -297,6 +318,165 @@ def publish_nuclear_teleport_lock():
             properties.remove(NukeConfig.TELEPORT_LOCK_PROPERTY)
     except Exception:
         pass
+
+
+def _new_logout_death_state():
+    return {"schema_version": 1, "players": {}}
+
+
+def _normalize_logout_death_entry(raw):
+    if not isinstance(raw, dict):
+        return None
+    payload_ids = raw.get("payload_ids", [])
+    if not isinstance(payload_ids, list):
+        payload_ids = []
+    normalized_ids = []
+    for payload_id in payload_ids:
+        value = to_unicode(payload_id).strip()
+        if value and value not in normalized_ids:
+            normalized_ids.append(value)
+    return {
+        "player_name": to_unicode(raw.get("player_name", u"Unknown"))[:32],
+        "payload_ids": normalized_ids,
+        "armed": bool(raw.get("armed", False)),
+        "timestamp": max(0, int(raw.get("timestamp", 0) or 0)),
+        "world": to_unicode(raw.get("world", u""))[:128],
+        "x": float(raw.get("x", 0.0) or 0.0),
+        "y": float(raw.get("y", 0.0) or 0.0),
+        "z": float(raw.get("z", 0.0) or 0.0),
+    }
+
+
+def save_logout_death_state():
+    try:
+        folder = os.path.dirname(NukeConfig.LOGOUT_DEATHS_FILE)
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        payload = {
+            "schema_version": 1,
+            "players": logout_death_state.get("players", {}),
+        }
+        temp_path = NukeConfig.LOGOUT_DEATHS_FILE + ".tmp"
+        with open(temp_path, "w") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=True, sort_keys=True)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        if hasattr(os, "replace"):
+            os.replace(temp_path, NukeConfig.LOGOUT_DEATHS_FILE)
+        else:
+            try:
+                os.rename(temp_path, NukeConfig.LOGOUT_DEATHS_FILE)
+            except OSError:
+                if os.path.exists(NukeConfig.LOGOUT_DEATHS_FILE):
+                    os.remove(NukeConfig.LOGOUT_DEATHS_FILE)
+                os.rename(temp_path, NukeConfig.LOGOUT_DEATHS_FILE)
+        return True
+    except Exception as exc:
+        log_info(u"&cНе удалось сохранить наказания за выход: {0}".format(exc))
+        return False
+
+
+def load_logout_death_state():
+    global logout_death_state
+    logout_death_state = _new_logout_death_state()
+    path = NukeConfig.LOGOUT_DEATHS_FILE
+    if not os.path.exists(path):
+        save_logout_death_state()
+        return
+    try:
+        with open(path, "r") as handle:
+            raw_state = json.load(handle)
+        raw_players = raw_state.get("players", {}) if isinstance(raw_state, dict) else {}
+        if not isinstance(raw_players, dict):
+            raise ValueError("players must be an object")
+        players = {}
+        for uuid_value, raw_entry in raw_players.items():
+            uuid_key = to_unicode(uuid_value).strip()
+            try:
+                entry = _normalize_logout_death_entry(raw_entry)
+            except Exception:
+                entry = None
+            if uuid_key and entry is not None:
+                players[uuid_key] = entry
+        logout_death_state = {"schema_version": 1, "players": players}
+        save_logout_death_state()
+    except Exception as exc:
+        corrupt_path = path + ".corrupt-" + str(int(time.time()))
+        try:
+            os.rename(path, corrupt_path)
+        except Exception:
+            pass
+        log_info(u"&cПовреждённый файл наказаний перенесён: {0}".format(exc))
+        logout_death_state = _new_logout_death_state()
+        save_logout_death_state()
+
+
+def active_payload_ids():
+    result = set()
+    for payload in list(active_payloads.values()):
+        try:
+            result.add(to_unicode(payload.payload_id))
+        except Exception:
+            pass
+    return result
+
+
+def discard_unarmed_logout_deaths():
+    """После reload/server restart незавершённые боеголовки уже не детонируют."""
+    active_ids = active_payload_ids()
+    players = logout_death_state.setdefault("players", {})
+    changed = False
+    for uuid_key, entry in list(players.items()):
+        if entry.get("armed", False):
+            continue
+        remaining = [value for value in entry.get("payload_ids", []) if value in active_ids]
+        if remaining:
+            entry["payload_ids"] = remaining
+        else:
+            players.pop(uuid_key, None)
+        changed = True
+    if changed:
+        save_logout_death_state()
+
+
+def arm_payload_logout_deaths(payload_id):
+    payload_id = to_unicode(payload_id)
+    changed = False
+    for entry in logout_death_state.setdefault("players", {}).values():
+        if payload_id in entry.get("payload_ids", []):
+            entry["armed"] = True
+            changed = True
+    if changed:
+        save_logout_death_state()
+
+
+def clear_payload_logout_candidates(payload_id):
+    """Отмена боеголовки снимает только ещё не подтверждённые ею наказания."""
+    payload_id = to_unicode(payload_id)
+    players = logout_death_state.setdefault("players", {})
+    changed = False
+    for uuid_key, entry in list(players.items()):
+        if entry.get("armed", False):
+            continue
+        payload_ids = [value for value in entry.get("payload_ids", []) if value != payload_id]
+        if len(payload_ids) == len(entry.get("payload_ids", [])):
+            continue
+        changed = True
+        if payload_ids:
+            entry["payload_ids"] = payload_ids
+        else:
+            players.pop(uuid_key, None)
+    if changed:
+        save_logout_death_state()
+
+
+def consume_logout_death(uuid_str):
+    players = logout_death_state.setdefault("players", {})
+    if players.pop(str(uuid_str), None) is not None:
+        save_logout_death_state()
 
 
 def material(name):
@@ -820,6 +1000,14 @@ class NuclearPayload(object):
         self.owner_name = to_unicode(owner.getName())
         self.world = location.getWorld()
         self.location = location.clone()
+        created_ms = now_ms()
+        self.payload_id = u"{0}:{1}:{2}".format(
+            world_key(self.world), self.owner_uuid, created_ms
+        )
+        self.impact_location = location.clone()
+        predicted_ground_y = scan_ground(location)
+        if predicted_ground_y is not None:
+            self.impact_location.setY(float(predicted_ground_y) + 1.82)
         self.velocity_y = -0.35
         self.age_ticks = 0
         self.stage = "falling"
@@ -829,7 +1017,7 @@ class NuclearPayload(object):
         self.countdown = NukeConfig.IMPACT_COUNTDOWN_SECONDS
         self.chunk = None
         self.teleport_lock_deadline_ms = (
-            now_ms() + NukeConfig.TELEPORT_LOCK_FAILSAFE_SECONDS * 1000
+            created_ms + NukeConfig.TELEPORT_LOCK_FAILSAFE_SECONDS * 1000
         )
 
     def spawn_visual(self):
@@ -968,6 +1156,7 @@ class NuclearPayload(object):
         if self.stage != "falling":
             return
         self.stage = "countdown"
+        self.impact_location = self.location.clone()
         cancel_task(self.fall_task_id)
         self.fall_task_id = -1
         self.velocity_y = 0.0
@@ -1049,14 +1238,20 @@ class NuclearPayload(object):
         cancel_task(self.countdown_task_id)
         self.countdown_task_id = -1
         self.cleanup_visual()
+        arm_payload_logout_deaths(self.payload_id)
         active_payloads.pop(world_key(self.world), None)
         try:
             detonate_at(self.location, self.owner_name, self.owner_uuid)
         finally:
-            post_detonation_lock_until_ms = max(
-                post_detonation_lock_until_ms,
-                now_ms() + NukeConfig.TELEPORT_LOCK_AFTER_DETONATION_SECONDS * 1000,
+            lock_deadline_ms = (
+                now_ms() + NukeConfig.TELEPORT_LOCK_AFTER_DETONATION_SECONDS * 1000
             )
+            post_detonation_lock_until_ms = max(post_detonation_lock_until_ms, lock_deadline_ms)
+            recent_detonation_zones.append({
+                "payload_id": self.payload_id,
+                "location": self.location.clone(),
+                "deadline_ms": lock_deadline_ms,
+            })
             publish_nuclear_teleport_lock()
 
     def cancel(self, refund=True):
@@ -1068,6 +1263,7 @@ class NuclearPayload(object):
         self.fall_task_id = -1
         self.countdown_task_id = -1
         self.cleanup_visual()
+        clear_payload_logout_candidates(self.payload_id)
         active_payloads.pop(world_key(self.world), None)
         publish_nuclear_teleport_lock()
         if refund:
@@ -1833,10 +2029,180 @@ def handle_player_drop(event):
     )
 
 
+def handle_player_quit(event):
+    player = event.getPlayer()
+    if player is None:
+        return
+    try:
+        player_location = player.getLocation()
+        uuid_str = str(player.getUniqueId())
+        player_name = to_unicode(player.getName())
+    except Exception:
+        return
+
+    matched_payload_ids = []
+    matched_detonated = False
+    radius_squared = float(NukeConfig.SHOCKWAVE_RADIUS ** 2)
+    for payload in list(active_payloads.values()):
+        try:
+            if payload.stage not in ("falling", "countdown"):
+                continue
+            target = payload.impact_location
+            if player_location.getWorld() != target.getWorld():
+                continue
+            if player_location.distanceSquared(target) <= radius_squared:
+                matched_payload_ids.append(to_unicode(payload.payload_id))
+        except Exception:
+            continue
+    current_ms = now_ms()
+    for zone in list(recent_detonation_zones):
+        try:
+            if int(zone.get("deadline_ms", 0)) <= current_ms:
+                recent_detonation_zones.remove(zone)
+                continue
+            target = zone.get("location")
+            if target is None or player_location.getWorld() != target.getWorld():
+                continue
+            if player_location.distanceSquared(target) <= radius_squared:
+                payload_id = to_unicode(zone.get("payload_id", u""))
+                if payload_id and payload_id not in matched_payload_ids:
+                    matched_payload_ids.append(payload_id)
+                matched_detonated = True
+        except Exception:
+            continue
+    if not matched_payload_ids:
+        return
+
+    players = logout_death_state.setdefault("players", {})
+    entry = players.get(uuid_str, {
+        "player_name": player_name,
+        "payload_ids": [],
+        "armed": False,
+        "timestamp": 0,
+        "world": u"",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+    })
+    payload_ids = list(entry.get("payload_ids", []))
+    for payload_id in matched_payload_ids:
+        if payload_id not in payload_ids:
+            payload_ids.append(payload_id)
+    entry.update({
+        "player_name": player_name,
+        "payload_ids": payload_ids,
+        "armed": bool(entry.get("armed", False) or matched_detonated),
+        "timestamp": int(time.time()),
+        "world": to_unicode(player_location.getWorld().getName()),
+        "x": float(player_location.getX()),
+        "y": float(player_location.getY()),
+        "z": float(player_location.getZ()),
+    })
+    players[uuid_str] = entry
+    save_logout_death_state()
+    log_info(u"Игрок &f{0}&7 вышел в зоне активного ядерного поражения.".format(player_name))
+
+
+def is_logout_death_due(uuid_str):
+    entry = logout_death_state.get("players", {}).get(str(uuid_str))
+    if entry is None:
+        return False
+    if entry.get("armed", False):
+        return True
+    return bool(set(entry.get("payload_ids", [])) & active_payload_ids())
+
+
+class LogoutDeathRunnable(Runnable):
+    def __init__(self, player, uuid_str):
+        self.player = player
+        self.uuid_str = str(uuid_str)
+        self.attempts = 0
+        self.task_id = -1
+
+    def finish(self, consume=False):
+        if consume:
+            consume_logout_death(self.uuid_str)
+        cancel_task(self.task_id)
+
+    def run(self):
+        try:
+            if not is_logout_death_due(self.uuid_str):
+                consume_logout_death(self.uuid_str)
+                self.finish(False)
+                return
+            if not self.player.isOnline():
+                self.finish(False)
+                return
+            if self.player.isDead() or self.player.getHealth() <= 0.0:
+                self.finish(True)
+                return
+
+            if self.attempts == 0:
+                send_message(
+                    self.player,
+                    NukeConfig.PREFIX
+                    + u"&4Вы покинули сервер в зоне ядерного поражения. Смерти избежать не удалось.",
+                )
+                safe_title(
+                    self.player,
+                    u"&4&l☢ ПОЗДНО ☢",
+                    u"&cВыход из сервера не спасает от ядерного удара",
+                    0,
+                    50,
+                    20,
+                )
+
+            self.attempts += 1
+            for unused_pulse in range(3):
+                if self.player.isDead() or self.player.getHealth() <= 0.0:
+                    break
+                try:
+                    self.player.setNoDamageTicks(0)
+                except Exception:
+                    pass
+                self.player.damage(2048.0)
+
+            if self.player.isDead() or self.player.getHealth() <= 0.0:
+                self.finish(True)
+                return
+            if self.attempts >= 5:
+                # Сначала всегда используется реальный урон. setHealth — только
+                # последний fallback против стороннего god-mode, отменяющего damage.
+                try:
+                    self.player.setHealth(0.0)
+                except Exception:
+                    pass
+                if self.player.isDead() or self.player.getHealth() <= 0.0:
+                    self.finish(True)
+                else:
+                    self.finish(False)
+        except Exception as exc:
+            log_info(u"&cОшибка наказания за выход при ядерном сбросе: {0}".format(exc))
+            self.finish(False)
+
+
+def schedule_logout_death(player):
+    try:
+        uuid_str = str(player.getUniqueId())
+    except Exception:
+        return False
+    if not is_logout_death_due(uuid_str):
+        consume_logout_death(uuid_str)
+        return False
+    plugin = get_pyspigot_plugin()
+    if plugin is None:
+        return False
+    runner = LogoutDeathRunnable(player, uuid_str)
+    task = Bukkit.getScheduler().runTaskTimer(plugin, runner, 1, 1)
+    runner.task_id = add_task(task)
+    return True
+
+
 def handle_player_join(event):
     player = event.getPlayer()
     discover_recipes(player)
     prepare_nuclear_advancements(player)
+    schedule_logout_death(player)
 
 
 def handle_craft_item(event):
@@ -2169,12 +2535,16 @@ def on_enable():
         NukeConfig.VERSION,
     ))
     post_detonation_lock_until_ms = 0
+    del recent_detonation_zones[:]
     publish_nuclear_teleport_lock()
+    load_logout_death_state()
+    discard_unarmed_logout_deaths()
     unregister_events()
     register_recipes()
     verify_nuclear_advancements()
     register_event(PlayerDropItemEvent, handle_player_drop)
     register_event(PlayerJoinEvent, handle_player_join)
+    register_event(PlayerQuitEvent, handle_player_quit)
     register_event(BlockPlaceEvent, handle_block_place)
     register_event(CraftItemEvent, handle_craft_item)
     register_bukkit_command()
@@ -2193,8 +2563,10 @@ def on_disable():
         except Exception:
             pass
     active_payloads.clear()
+    del recent_detonation_zones[:]
     post_detonation_lock_until_ms = 0
     publish_nuclear_teleport_lock()
+    save_logout_death_state()
     for crater in list(active_craters.values()):
         try:
             crater.cancel()
