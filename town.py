@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import time
+import copy
 
 try:
     unicode
@@ -237,9 +238,13 @@ def format_currency(amount):
 def parse_amount(raw):
     text = to_unicode(raw).replace(",", ".").replace(" ", "")
     amount = float(text)
-    if amount <= 0:
+    if amount != amount or amount in (float("inf"), float("-inf")) or amount <= 0 or amount > 10000000000000000.0:
         raise ValueError()
     return round(amount, 2)
+
+
+def reject_json_constant(value):
+    raise ValueError("non-finite JSON number: {0}".format(value))
 
 
 def load_companies_data():
@@ -386,7 +391,7 @@ tp_cooldowns = {}
 
 class CitiesConfig(object):
     PLUGIN_NAME = u"SmartY-Politic"
-    VERSION = u"1.5.4"
+    VERSION = u"1.5.5"
     PREFIX = u"&9&l[Политика]&r "
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
@@ -432,41 +437,97 @@ class CitiesConfig(object):
 class JsonStorage(object):
     def __init__(self, path, defaults):
         self.path = path
+        self.backup_path = path + ".bak"
         self.defaults = defaults
+        self.loaded_ok = False
+        self.primary_valid = False
+
+    def read_file(self, path):
+        with open(path, "r") as handle:
+            return self.merge_defaults(json.load(handle, parse_constant=reject_json_constant))
 
     def load(self):
         self.ensure_dir()
         if not os.path.exists(self.path):
+            if os.path.exists(self.backup_path):
+                try:
+                    data = self.read_file(self.backup_path)
+                    self.loaded_ok = True
+                    log_info(u"Loaded cities data from backup because the primary file is missing.")
+                    return data
+                except Exception as exc:
+                    log_info(u"Cannot read cities backup: {0}".format(exc))
+                    return self.merge_defaults({})
+            self.loaded_ok = True
             return self.merge_defaults({})
         try:
-            with open(self.path, "r") as handle:
-                return self.merge_defaults(json.load(handle))
+            data = self.read_file(self.path)
+            self.loaded_ok = True
+            self.primary_valid = True
+            return data
         except UnicodeDecodeError:
             try:
                 with open(self.path, "rb") as handle:
                     raw = handle.read()
-                    return self.merge_defaults(json.loads(raw.decode("utf-8")))
+                    data = self.merge_defaults(json.loads(raw.decode("utf-8"), parse_constant=reject_json_constant))
+                    self.loaded_ok = True
+                    self.primary_valid = True
+                    return data
             except Exception as exc:
                 log_info(u"Cannot read cities data as UTF-8: {0}".format(exc))
-                return self.merge_defaults({})
         except Exception as exc:
             log_info(u"Cannot read cities data: {0}".format(exc))
-            return self.merge_defaults({})
+
+        if os.path.exists(self.backup_path):
+            try:
+                data = self.read_file(self.backup_path)
+                self.loaded_ok = True
+                log_info(u"Loaded cities data from backup; primary file is damaged.")
+                return data
+            except Exception as exc:
+                log_info(u"Cannot read cities backup: {0}".format(exc))
+        return self.merge_defaults({})
 
     def save(self, data):
-        self.ensure_dir()
         temp_path = self.path + ".tmp"
-        with open(temp_path, "w") as handle:
-            handle.write(json.dumps(data, indent=2, ensure_ascii=True, sort_keys=True))
-        if hasattr(os, "replace"):
-            os.replace(temp_path, self.path)
-        else:
-            if os.path.exists(self.path):
+        if not self.loaded_ok:
+            log_info(u"Refusing to overwrite cities data that failed to load.")
+            return False
+        try:
+            self.ensure_dir()
+            with open(temp_path, "w") as handle:
+                handle.write(json.dumps(data, indent=2, ensure_ascii=True, sort_keys=True, allow_nan=False))
+                handle.flush()
                 try:
-                    os.remove(self.path)
+                    os.fsync(handle.fileno())
                 except Exception:
                     pass
-            os.rename(temp_path, self.path)
+            if self.primary_valid and os.path.exists(self.path):
+                backup_tmp = self.backup_path + ".tmp"
+                try:
+                    with open(self.path, "rb") as source:
+                        with open(backup_tmp, "wb") as target:
+                            target.write(source.read())
+                            target.flush()
+                            try:
+                                os.fsync(target.fileno())
+                            except Exception:
+                                pass
+                    if hasattr(os, "replace"):
+                        os.replace(backup_tmp, self.backup_path)
+                    else:
+                        os.rename(backup_tmp, self.backup_path)
+                except Exception as backup_exc:
+                    log_info(u"Cannot update cities backup: {0}".format(backup_exc))
+            if hasattr(os, "replace"):
+                os.replace(temp_path, self.path)
+            else:
+                os.rename(temp_path, self.path)
+            self.primary_valid = True
+            return True
+        except Exception as exc:
+            log_info(u"Cannot save cities data: {0}".format(exc))
+            return False
 
     def ensure_dir(self):
         folder = os.path.dirname(self.path)
@@ -495,22 +556,19 @@ class EconomyGateway(object):
                 if not manager:
                     manager = System.getProperties().get("SmartY_EconomyManager")
                 if manager:
+                    try:
+                        if hasattr(manager, "is_active") and not manager.is_active():
+                            return None
+                    except Exception:
+                        return None
                     return manager
             except Exception:
                 pass
-        if "economy" in sys.modules:
-            module = sys.modules["economy"]
-            if hasattr(module, "EconomyManager"):
-                return module.EconomyManager()
-        try:
-            from economy import EconomyManager
-            return EconomyManager()
-        except Exception:
-            return None
+        # Importing economy.py here would silently resurrect an unloaded script.
+        return None
 
     def is_ready(self):
-        if self.manager is None:
-            self.refresh()
+        self.refresh()
         return self.manager is not None
 
     def get_or_create(self, uuid_str, name):
@@ -532,6 +590,20 @@ class EconomyGateway(object):
         if not self.is_ready():
             return 0.0
         return self.manager.deposit(uuid_str, amount, name)
+
+    def deposit_checked(self, uuid_str, amount, name):
+        if not self.is_ready():
+            return False, 0.0
+        if hasattr(self.manager, "deposit_checked"):
+            return self.manager.deposit_checked(uuid_str, amount, name)
+        return True, self.manager.deposit(uuid_str, amount, name)
+
+    def transfer(self, from_uuid, to_uuid, amount, to_name):
+        if not self.is_ready():
+            return False, 0.0, 0.0
+        if hasattr(self.manager, "transfer"):
+            return self.manager.transfer(from_uuid, to_uuid, amount, to_name)
+        return False, self.manager.get_balance(from_uuid), self.manager.get_balance(to_uuid)
 
     def get_balance(self, uuid_str):
         if not self.is_ready():
@@ -567,7 +639,7 @@ class CityState(object):
 
     def save(self):
         self.normalize_existing_data()
-        self.storage.save(self.data)
+        return self.storage.save(self.data)
 
     def normalize_existing_data(self):
         self.data.setdefault("cities", {})
@@ -771,18 +843,28 @@ class CityState(object):
         self.save()
 
     def change_treasury(self, city, delta, actor_name=None, actor_uuid=None):
+        snapshot = copy.deepcopy(city)
         current = float(city.get("treasury", 0.0))
-        city["treasury"] = round(max(0.0, current + float(delta)), 2)
+        change = float(delta)
+        if current != current or change != change or current in (float("inf"), float("-inf")) or change in (float("inf"), float("-inf")):
+            return None
+        new_total = current + change
+        if new_total < 0.0 or new_total > 10000000000000000.0:
+            return None
+        city["treasury"] = round(new_total, 2)
         if delta > 0:
             if actor_name:
                 self.add_treasury_log(city, u"§f" + to_unicode(actor_name) + u" §aвнёс +" + format_currency(delta))
             if actor_uuid:
                 contribs = city.setdefault("contributions", {})
-                contribs[str(actor_uuid)] = contribs.get(str(actor_uuid), 0.0) + float(delta)
+                contribs[str(actor_uuid)] = round(float(contribs.get(str(actor_uuid), 0.0)) + change, 2)
         elif delta < 0 and actor_name:
             self.add_treasury_log(city, u"§f" + to_unicode(actor_name) + u" §cснял " + format_currency(abs(delta)))
         city["updated_at"] = int(time.time())
-        self.save()
+        if not self.save():
+            city.clear()
+            city.update(snapshot)
+            return None
         return city["treasury"]
 
     def add_treasury_log(self, city, msg):
@@ -1270,10 +1352,24 @@ class CityService(object):
         city = self.require_own_city(sender)
         if not city:
             return
-        if not self.economy.withdraw(uuid_str, amount):
+        if not self.economy.is_ready():
+            send_message(sender, CitiesConfig.PREFIX + u"&cЭкономика сейчас отключена. Операция отменена.")
+            return
+        if self.economy.get_balance(uuid_str) < amount:
             send_message(sender, CitiesConfig.PREFIX + u"&cНедостаточно денег.")
             return
+        if not self.economy.withdraw(uuid_str, amount):
+            send_message(sender, CitiesConfig.PREFIX + u"&cНе удалось сохранить списание. Баланс не изменён.")
+            return
         total = self.state.change_treasury(city, amount, actor_name=player_name, actor_uuid=uuid_str)
+        if total is None:
+            refunded, balance = self.economy.deposit_checked(uuid_str, amount, player_name)
+            if not refunded:
+                log_info(u"CRITICAL: failed to refund town deposit for {0}, amount={1}".format(player_name, amount))
+                send_message(sender, CitiesConfig.PREFIX + u"&4Ошибка возврата денег. Немедленно сообщите администратору.")
+            else:
+                send_message(sender, CitiesConfig.PREFIX + u"&cНе удалось сохранить казну. Операция отменена, деньги возвращены.")
+            return
         send_message(sender, CitiesConfig.PREFIX + u"&aВы пополнили казну &e{0}&a на &6{1}&a. Казна: &6{2}&a.".format(
             city["name"], format_currency(amount), format_currency(total)
         ))
@@ -1289,8 +1385,23 @@ class CityService(object):
         if amount > treasury:
             send_message(sender, CitiesConfig.PREFIX + u"&cВ казне недостаточно денег. Сейчас: &e{0}&c.".format(format_currency(treasury)))
             return
-        self.state.change_treasury(city, -amount, actor_name=player_name)
-        balance = self.economy.deposit(uuid_str, amount, player_name)
+        if not self.economy.is_ready():
+            send_message(sender, CitiesConfig.PREFIX + u"&cЭкономика сейчас отключена. Операция отменена.")
+            return
+        city_snapshot = copy.deepcopy(city)
+        total = self.state.change_treasury(city, -amount, actor_name=player_name)
+        if total is None:
+            send_message(sender, CitiesConfig.PREFIX + u"&cНе удалось сохранить казну. Операция отменена.")
+            return
+        deposited, balance = self.economy.deposit_checked(uuid_str, amount, player_name)
+        if not deposited:
+            city.clear()
+            city.update(city_snapshot)
+            restored = self.state.save()
+            if not restored:
+                log_info(u"CRITICAL: failed to roll back town withdrawal for {0}, amount={1}".format(player_name, amount))
+            send_message(sender, CitiesConfig.PREFIX + u"&cНе удалось начислить деньги. Операция отменена.")
+            return
         send_message(sender, CitiesConfig.PREFIX + u"&aВы вывели из казны &6{0}&a. Ваш баланс: &e{1}&a.".format(
             format_currency(amount), format_currency(balance)
         ))
@@ -2165,10 +2276,12 @@ class TownResidentSubmenuGUI(BaseTownGUI):
 
         if raw_slot == 10:
             amount = 500.0 if click_type in ("RIGHT", "RIGHT_CLICK") else 100.0
-            if not economy.withdraw(uuid_str, amount):
-                send_message(player, CitiesConfig.PREFIX + u"&cНедостаточно денег (нужно {0}).".format(format_currency(amount)))
+            success, sender_balance, target_balance = economy.transfer(
+                uuid_str, self.target_uuid, amount, self.target_name
+            )
+            if not success:
+                send_message(player, CitiesConfig.PREFIX + u"&cПеревод не выполнен. Проверьте баланс и доступность экономики.")
                 return
-            economy.deposit(self.target_uuid, amount, self.target_name)
             send_message(player, CitiesConfig.PREFIX + u"&aВы перевели &e{0} &aжителю &f{1}&a.".format(format_currency(amount), self.target_name))
             service.notify_player(self.target_name, u"&aИгрок &f{0} &aперевёл вам &e{1}&a!".format(my_name, format_currency(amount)))
             self.open()
@@ -3096,12 +3209,20 @@ class TownProjectDetailsGUI(BaseTownGUI):
         if amount <= 0:
             send_message(player, CitiesConfig.PREFIX + u"&cСумма должна быть больше нуля.")
             return
+        city_snapshot = copy.deepcopy(city)
         if not economy.withdraw(uuid_str, amount):
             send_message(player, CitiesConfig.PREFIX + u"&cНедостаточно денег (нужно %s)." % format_currency(amount))
             return
         pdata["contributed_money"] = float(pdata.get("contributed_money", 0.0)) + amount
         state.add_treasury_log(city, u"§a+ %s в проект %s (от %s)" % (format_currency(amount), pdata["name"], name))
-        state.save()
+        if not state.save():
+            city.clear()
+            city.update(city_snapshot)
+            refunded, balance = economy.deposit_checked(uuid_str, amount, name)
+            if not refunded:
+                log_info(u"CRITICAL: failed to refund project deposit for {0}, amount={1}".format(name, amount))
+            send_message(player, CitiesConfig.PREFIX + u"&cНе удалось сохранить фонд проекта. Операция отменена.")
+            return
         send_message(player, CitiesConfig.PREFIX + u"&aВы внесли &e%s &aв фонд проекта «%s»!" % (format_currency(amount), pdata["name"]))
         self.open()
 
@@ -3114,10 +3235,22 @@ class TownProjectDetailsGUI(BaseTownGUI):
         if amount > cont:
             send_message(player, CitiesConfig.PREFIX + u"&cВ фонде проекта только %s." % format_currency(cont))
             return
+        city_snapshot = copy.deepcopy(city)
         pdata["contributed_money"] = cont - amount
-        economy.deposit(uuid_str, amount, name)
         state.add_treasury_log(city, u"§c- %s из проекта %s (забрал %s)" % (format_currency(amount), pdata["name"], name))
-        state.save()
+        if not state.save():
+            city.clear()
+            city.update(city_snapshot)
+            send_message(player, CitiesConfig.PREFIX + u"&cНе удалось сохранить фонд проекта. Операция отменена.")
+            return
+        deposited, balance = economy.deposit_checked(uuid_str, amount, name)
+        if not deposited:
+            city.clear()
+            city.update(city_snapshot)
+            if not state.save():
+                log_info(u"CRITICAL: failed to roll back project withdrawal for {0}, amount={1}".format(name, amount))
+            send_message(player, CitiesConfig.PREFIX + u"&cНе удалось начислить деньги. Операция отменена.")
+            return
         send_message(player, CitiesConfig.PREFIX + u"&6Вы забрали &e%s &6из фонда проекта «%s»." % (format_currency(amount), pdata["name"]))
         self.open()
 
@@ -5283,7 +5416,10 @@ def on_enable():
     log_info(u"Starting {0} v{1}".format(CitiesConfig.PLUGIN_NAME, CitiesConfig.VERSION))
     storage = JsonStorage(CitiesConfig.DATA_FILE, CitiesConfig.DEFAULT_STATE)
     state = CityState(storage)
-    state.save()
+    if not storage.loaded_ok:
+        raise RuntimeError("cities.json is damaged and no valid backup is available")
+    if not state.save():
+        raise RuntimeError("cities.json is not writable")
     economy = EconomyGateway()
     service = CityService(state, economy)
     command_handler = CityCommand(service, state, economy)
