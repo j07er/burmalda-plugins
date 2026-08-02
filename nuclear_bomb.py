@@ -105,7 +105,7 @@ except ImportError:
 
 class NukeConfig(object):
     PLUGIN_NAME = u"SmartY-Nuclear"
-    VERSION = u"1.0.0"
+    VERSION = u"1.1.0"
     PREFIX = u"&8[&c☢&8] &r"
 
     MIN_DROP_HEIGHT = 18
@@ -114,6 +114,9 @@ class NukeConfig(object):
     GLOBAL_COOLDOWN_SECONDS = 120
     SPAWN_PROTECTION_RADIUS = 192
     MAX_FALL_SECONDS = 30
+    TELEPORT_LOCK_FAILSAFE_SECONDS = 15 * 60
+    TELEPORT_LOCK_AFTER_DETONATION_SECONDS = 5
+    TELEPORT_LOCK_PROPERTY = "SmartY_NuclearTeleportLockUntil"
 
     EXPLOSION_POWER = 144.0
     BLOCK_EXPLOSION_POWER = 16.0
@@ -165,6 +168,7 @@ scheduled_task_ids = set()
 particle_cache = {}
 missing_advancement_warnings = set()
 last_launch_ms = 0
+post_detonation_lock_until_ms = 0
 initialized = False
 
 
@@ -273,6 +277,26 @@ def now_ms():
         except Exception:
             pass
     return int(time.time() * 1000)
+
+
+def publish_nuclear_teleport_lock():
+    """Публикует общий дедлайн блокировки городских телепортов между скриптами."""
+    if System is None:
+        return
+    deadline_ms = int(post_detonation_lock_until_ms)
+    for payload in list(active_payloads.values()):
+        try:
+            deadline_ms = max(deadline_ms, int(payload.teleport_lock_deadline_ms))
+        except Exception:
+            pass
+    try:
+        properties = System.getProperties()
+        if deadline_ms > now_ms():
+            properties.put(NukeConfig.TELEPORT_LOCK_PROPERTY, str(deadline_ms))
+        else:
+            properties.remove(NukeConfig.TELEPORT_LOCK_PROPERTY)
+    except Exception:
+        pass
 
 
 def material(name):
@@ -804,6 +828,9 @@ class NuclearPayload(object):
         self.countdown_task_id = -1
         self.countdown = NukeConfig.IMPACT_COUNTDOWN_SECONDS
         self.chunk = None
+        self.teleport_lock_deadline_ms = (
+            now_ms() + NukeConfig.TELEPORT_LOCK_FAILSAFE_SECONDS * 1000
+        )
 
     def spawn_visual(self):
         red = Color.fromRGB(190, 20, 20)
@@ -864,6 +891,7 @@ class NuclearPayload(object):
     def start(self):
         self.spawn_visual()
         active_payloads[world_key(self.world)] = self
+        publish_nuclear_teleport_lock()
         plugin = get_pyspigot_plugin()
         runner = PayloadFallRunnable(self)
         task = Bukkit.getScheduler().runTaskTimer(plugin, runner, 0, 2)
@@ -1014,6 +1042,7 @@ class NuclearPayload(object):
         self.countdown -= 1
 
     def detonate(self):
+        global post_detonation_lock_until_ms
         if self.stage == "detonated":
             return
         self.stage = "detonated"
@@ -1021,7 +1050,14 @@ class NuclearPayload(object):
         self.countdown_task_id = -1
         self.cleanup_visual()
         active_payloads.pop(world_key(self.world), None)
-        detonate_at(self.location, self.owner_name, self.owner_uuid)
+        try:
+            detonate_at(self.location, self.owner_name, self.owner_uuid)
+        finally:
+            post_detonation_lock_until_ms = max(
+                post_detonation_lock_until_ms,
+                now_ms() + NukeConfig.TELEPORT_LOCK_AFTER_DETONATION_SECONDS * 1000,
+            )
+            publish_nuclear_teleport_lock()
 
     def cancel(self, refund=True):
         if self.stage == "detonated":
@@ -1033,6 +1069,7 @@ class NuclearPayload(object):
         self.countdown_task_id = -1
         self.cleanup_visual()
         active_payloads.pop(world_key(self.world), None)
+        publish_nuclear_teleport_lock()
         if refund:
             try:
                 self.world.dropItemNaturally(self.location, create_nuke())
@@ -2119,7 +2156,7 @@ def unregister_events():
 
 
 def on_enable():
-    global initialized
+    global initialized, post_detonation_lock_until_ms
     if initialized or not BUKKIT_AVAILABLE:
         return
     plugin = get_pyspigot_plugin()
@@ -2131,6 +2168,8 @@ def on_enable():
         NukeConfig.PLUGIN_NAME,
         NukeConfig.VERSION,
     ))
+    post_detonation_lock_until_ms = 0
+    publish_nuclear_teleport_lock()
     unregister_events()
     register_recipes()
     verify_nuclear_advancements()
@@ -2147,13 +2186,15 @@ def on_enable():
 
 
 def on_disable():
-    global initialized
+    global initialized, post_detonation_lock_until_ms
     for payload in list(active_payloads.values()):
         try:
             payload.cancel(True)
         except Exception:
             pass
     active_payloads.clear()
+    post_detonation_lock_until_ms = 0
+    publish_nuclear_teleport_lock()
     for crater in list(active_craters.values()):
         try:
             crater.cancel()

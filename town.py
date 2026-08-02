@@ -314,6 +314,34 @@ def is_admin(sender):
         return False
 
 
+NUCLEAR_TELEPORT_LOCK_PROPERTY = "SmartY_NuclearTeleportLockUntil"
+
+
+def is_nuclear_teleport_locked():
+    """Читает опубликованный nuclear_bomb.py дедлайн без прямого импорта скрипта."""
+    if not JAVA_STRING_AVAILABLE or System is None:
+        return False
+    try:
+        raw_deadline = System.getProperties().get(NUCLEAR_TELEPORT_LOCK_PROPERTY)
+        if raw_deadline is None:
+            return False
+        deadline_ms = int(to_unicode(raw_deadline).strip())
+        return int(System.currentTimeMillis()) < deadline_ms
+    except Exception:
+        return False
+
+
+def deny_city_teleport_during_nuclear_drop(player):
+    if not is_nuclear_teleport_locked():
+        return False
+    send_message(
+        player,
+        CitiesConfig.PREFIX
+        + u"&4☢ &cТелепортация города заблокирована: зафиксирован ядерный сброс! &7Спасайтесь без телепорта.",
+    )
+    return True
+
+
 def get_pyspigot_plugin():
     if not BUKKIT_AVAILABLE:
         return None
@@ -358,7 +386,7 @@ tp_cooldowns = {}
 
 class CitiesConfig(object):
     PLUGIN_NAME = u"SmartY-Politic"
-    VERSION = u"1.5.3"
+    VERSION = u"1.5.4"
     PREFIX = u"&9&l[Политика]&r "
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
@@ -1303,6 +1331,8 @@ class CityService(object):
         if not isinstance(sender, Player):
             send_message(sender, CitiesConfig.PREFIX + u"&cТолько для игроков.")
             return
+        if deny_city_teleport_during_nuclear_drop(sender):
+            return
         city = self.require_own_city(sender)
         if not city:
             return
@@ -2144,6 +2174,8 @@ class TownResidentSubmenuGUI(BaseTownGUI):
             self.open()
 
         elif raw_slot == 12:
+            if deny_city_teleport_during_nuclear_drop(player):
+                return
             target_player = service.get_online_player_by_uuid(self.target_uuid)
             if not target_player:
                 send_message(player, CitiesConfig.PREFIX + u"&cИгрок &f{0} &cсейчас оффлайн!".format(self.target_name))
