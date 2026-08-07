@@ -16,6 +16,7 @@ SmartY-Economy System — ВЕРСИЯ 3.0.0 (PAYDAY & MOB MONEY DROP SYSTEM)
 import os
 import sys
 import json
+import hashlib
 import time
 import re
 import random
@@ -255,7 +256,7 @@ def reject_json_constant(value):
 # -----------------------------------------------------------------------------
 class EconomyConfig:
     PLUGIN_NAME = u"SmartY-Economy"
-    VERSION = u"3.6.0"
+    VERSION = u"3.6.6"
     PREFIX = u"&a&l[\u042d\u043a\u043e\u043d\u043e\u043c\u0438\u043a\u0430]&r "
 
     DEFAULT_BALANCE = 100.0
@@ -273,6 +274,8 @@ class EconomyConfig:
     COMPANIES_FILE = os.path.join(DATA_DIR, "companies.json")
     TRANSACTIONS_LOG = os.path.join(DATA_DIR, "economy_transactions.log")
     DB_BACKUP_FILE = DB_FILE + ".bak"
+    PROCESSED_OPERATION_RETENTION_SECONDS = 90 * 24 * 60 * 60
+    MAX_PROCESSED_OPERATIONS = 50000
 
     # Порог "неактивности" для payday (сек). Игрок должен был сдвинуться
     # в течение этого окна, иначе прогресс payday замирает. Настраивается
@@ -568,7 +571,31 @@ class EconomyManager(object):
         self.payday_amount = float(EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
         self.payday_afk_threshold = float(EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
         self.sleep_defaults = {}
+        self.processed_operations = {}
         self._database_loaded = self.load_database()
+
+    def _pruned_operations(self, operations, now=None):
+        now = int(time.time()) if now is None else int(now)
+        cutoff = now - EconomyConfig.PROCESSED_OPERATION_RETENTION_SECONDS
+        items = []
+        for operation_id, record in (operations or {}).items():
+            try:
+                clean_id = str(operation_id)
+                if isinstance(record, dict):
+                    clean_timestamp = int(record.get("timestamp", 0))
+                    clean_record = {
+                        "timestamp": clean_timestamp,
+                        "digest": str(record.get("digest", ""))
+                    }
+                else:
+                    clean_timestamp = int(record)
+                    clean_record = {"timestamp": clean_timestamp, "digest": ""}
+            except Exception:
+                continue
+            if clean_id and clean_timestamp >= cutoff:
+                items.append((clean_id, clean_timestamp, clean_record))
+        items.sort(key=lambda item: item[1], reverse=True)
+        return dict([(item[0], item[2]) for item in items[:EconomyConfig.MAX_PROCESSED_OPERATIONS]])
 
     def _published_manager(self):
         if not JAVA_STRING_AVAILABLE or System is None:
@@ -636,6 +663,7 @@ class EconomyManager(object):
         loaded_accounts = {}
         loaded_names = {}
         loaded_sleep_defaults = {}
+        loaded_operations = {}
         try:
             for uuid_str, acc_dict in data.get("accounts", {}).items():
                 if not isinstance(acc_dict, dict):
@@ -649,6 +677,10 @@ class EconomyManager(object):
                     loaded_names[acc.name.lower()] = str(uuid_str)
             for world_name, percent in (data.get("sleep_defaults", {}) or {}).items():
                 loaded_sleep_defaults[to_unicode(world_name)] = max(1, min(100, int(percent)))
+            raw_operations = data.get("processed_operations", {}) or {}
+            if not isinstance(raw_operations, dict):
+                raise ValueError("processed_operations must be an object")
+            loaded_operations = self._pruned_operations(raw_operations)
         except Exception as exc:
             log_error(u"Economy database validation failed: {0}".format(exc))
             return False
@@ -661,18 +693,20 @@ class EconomyManager(object):
             self.payday_amount = safe_amount(data.get("payday_amount", EconomyConfig.DEFAULT_PAYDAY_AMOUNT), default=EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
             self.payday_afk_threshold = safe_amount(data.get("payday_afk_threshold", EconomyConfig.DEFAULT_PAYDAY_INACTIVITY), default=EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
             self.sleep_defaults = loaded_sleep_defaults
+            self.processed_operations = loaded_operations
         finally:
             self._lock.release()
         return True
 
     def _database_payload(self):
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "saved_at": int(time.time()),
             "jackpot_bank": round(safe_amount(self.jackpot_bank, 0.0), 2),
             "payday_amount": round(float(self.payday_amount), 2),
             "payday_afk_threshold": round(float(self.payday_afk_threshold), 1),
             "sleep_defaults": {str(wn): int(pct) for wn, pct in self.sleep_defaults.items()},
+            "processed_operations": dict(self.processed_operations),
             "accounts": {uuid_str: acc.to_dict() for uuid_str, acc in self.accounts.items()}
         }
 
@@ -834,6 +868,104 @@ class EconomyManager(object):
     def deposit(self, uuid_str, amount, name=None):
         success, balance = self.deposit_checked(uuid_str, amount, name)
         return balance
+
+    def deposit_batch_once(self, operation_id, payouts):
+        """Atomically credits an idempotent batch, including offline accounts."""
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            if hasattr(manager, "deposit_batch_once"):
+                return manager.deposit_batch_once(operation_id, payouts)
+            return False, False
+        operation_key = str(operation_id or "").strip()
+        if manager is None or not operation_key or len(operation_key) > 200:
+            return False, False
+
+        normalized = {}
+        try:
+            for entry in payouts:
+                uuid_key = str(entry[0]).strip()
+                amount = safe_amount(entry[1], default=None)
+                name = to_unicode(entry[2]) if len(entry) > 2 and entry[2] else u"Investor"
+                if not uuid_key or amount is None or amount <= 0.0:
+                    return False, False
+                amount_cents = int(round(float(amount) * 100.0))
+                if amount_cents <= 0:
+                    return False, False
+                current = normalized.get(uuid_key)
+                if current is None:
+                    normalized[uuid_key] = [amount_cents, name]
+                else:
+                    current[0] += amount_cents
+        except Exception:
+            return False, False
+        if not normalized:
+            return False, False
+        digest_source = u"|".join([
+            u"{0}:{1}".format(uuid_key, normalized[uuid_key][0])
+            for uuid_key in sorted(normalized.keys())
+        ])
+        operation_digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+
+        changed_uuids = []
+        old_balances = {}
+        created_uuids = []
+        self._lock.acquire()
+        try:
+            if operation_key in self.processed_operations:
+                old_record = self.processed_operations.get(operation_key)
+                old_digest = old_record.get("digest", "") if isinstance(old_record, dict) else ""
+                if old_digest and old_digest != operation_digest:
+                    log_error(u"Rejected reused operation ID {0} with different payouts".format(operation_key))
+                    return False, False
+                return True, True
+
+            old_name_to_uuid = dict(self.name_to_uuid)
+            old_operations = self.processed_operations
+            for uuid_key, entry in normalized.items():
+                amount = float(entry[0]) / 100.0
+                acc = self.accounts.get(uuid_key)
+                if acc is None:
+                    account_name = entry[1]
+                    if account_name.lower() in (u"investor", u"unknown"):
+                        account_name = u"Unknown"
+                    acc = Account(uuid_key, account_name, balance=0.0)
+                    self.accounts[uuid_key] = acc
+                    created_uuids.append(uuid_key)
+                    if acc.name and acc.name != u"Unknown":
+                        self.name_to_uuid[acc.name.lower()] = uuid_key
+                old_balances[uuid_key] = acc.balance
+                if acc.balance + amount > EconomyConfig.MAX_BALANCE:
+                    raise ValueError("recipient balance limit exceeded")
+                acc.balance = round(acc.balance + amount, 2)
+                changed_uuids.append(uuid_key)
+
+            new_operations = dict(old_operations)
+            new_operations[operation_key] = {
+                "timestamp": int(time.time()),
+                "digest": operation_digest
+            }
+            self.processed_operations = self._pruned_operations(new_operations)
+            if not self.save_database():
+                raise IOError("economy database save failed")
+        except Exception as exc:
+            for uuid_key, old_balance in old_balances.items():
+                if uuid_key in self.accounts:
+                    self.accounts[uuid_key].balance = old_balance
+            for uuid_key in created_uuids:
+                self.accounts.pop(uuid_key, None)
+            if 'old_name_to_uuid' in locals():
+                self.name_to_uuid = old_name_to_uuid
+            if 'old_operations' in locals():
+                self.processed_operations = old_operations
+            log_error(u"Atomic batch deposit {0} failed: {1}".format(operation_key, exc))
+            return False, False
+        finally:
+            self._lock.release()
+
+        for uuid_key in changed_uuids:
+            update_online_player_hud(uuid_key)
+        invalidate_baltop_cache()
+        return True, False
 
     def withdraw(self, uuid_str, amount):
         manager = self.current_manager()
@@ -1397,10 +1529,23 @@ def get_player_town_profile(uuid_str):
 
 def get_company_share_price(company):
     try:
-        available = int(company.get("available_shares", 10000))
+        total = 10000
+        available = max(0, min(total, int(company.get("available_shares", total))))
+        issued = total - available
         start_price = float(company.get("start_price", 10.0))
-        backing = float(company.get("balance", 0.0)) + float(available) * start_price
-        return max(1.0, round(backing / 10000.0, 2))
+        balance = float(company.get("balance", 0.0))
+        if "price_offset" not in company:
+            if company.get("share_price") is not None:
+                migrated_price = float(company.get("share_price"))
+                if migrated_price == migrated_price and migrated_price not in (float("inf"), float("-inf")):
+                    return max(1.0, round(migrated_price, 6))
+            return max(1.0, round((balance + available * start_price) / float(total), 6))
+        offset = float(company.get("price_offset", 0.0))
+        values = (start_price, balance, offset)
+        if any(value != value or value == float("inf") or value == float("-inf") for value in values):
+            return 0.0
+        price = start_price + balance / float(total) + issued * start_price / float(total) + offset
+        return max(1.0, round(price, 6))
     except Exception:
         return 0.0
 
@@ -1638,29 +1783,30 @@ def reset_online_payday_checks():
 
 def start_payday_timer():
     global payday_task_id, payday_task_obj
-    stop_payday_timer()
-    # ФИКС "большого payday": дополнительно отменяем любой таймер от
-    # ПРЕДЫДУЩЕЙ загрузки этого скрипта в этой же JVM (см. _SYS_PROP_PAYDAY_TASK) —
-    # обычная переменная payday_task_id обнуляется при каждой перезагрузке
-    # модуля, поэтому stop_payday_timer() выше не видит старый таймер из ПРОШЛОЙ загрузки.
+    # Сначала отменяем задачу от предыдущей загрузки: stop_payday_timer()
+    # очищает System property и после него старый ID уже будет недоступен.
     _cancel_stale_task_by_system_property(_SYS_PROP_PAYDAY_TASK)
+    stop_payday_timer()
     plugin = get_pyspigot_plugin()
     if plugin:
         try:
             # 1200 тиков = 60 секунд (раз в минуту проверяем и прибавляем +1 мин наигранного времени)
             owner = EconomyManager()
-            if PYSPIGOT_MANAGERS_AVAILABLE:
-                payday_task_obj = _pyspigot.task_manager().scheduleRepeatingTask(run_managed_payday, 1200, 1200, owner)
-            else:
-                payday_task_obj = Bukkit.getScheduler().runTaskTimer(plugin, PaydayRunnable(owner), 1200, 1200)
+            payday_task_obj = Bukkit.getScheduler().runTaskTimer(
+                plugin, PaydayRunnable(owner), 1200, 1200
+            )
             try:
                 payday_task_id = payday_task_obj.getTaskId()
             except Exception:
                 payday_task_id = -1
             _store_task_id_in_system_property(_SYS_PROP_PAYDAY_TASK, payday_task_id)
             log_info(u"Started Personal Playtime Payday timer task (ID: {0}, period: 60s).".format(payday_task_id))
+            return True
         except Exception as e:
             log_error(u"Failed to start payday timer: {0}".format(e))
+    else:
+        log_error(u"Failed to start payday timer: PySpigot plugin not found.")
+    return False
 
 
 def stop_payday_timer():
@@ -1684,34 +1830,30 @@ def stop_payday_timer():
 
 def start_afk_timer():
     global afk_task_id, afk_task_obj
-    stop_afk_timer()
     _cancel_stale_task_by_system_property(_SYS_PROP_AFK_TASK)
+    stop_afk_timer()
     plugin = get_pyspigot_plugin()
     if plugin:
         try:
             owner = EconomyManager()
-            if PYSPIGOT_MANAGERS_AVAILABLE:
-                afk_task_obj = _pyspigot.task_manager().scheduleRepeatingTask(
-                    run_managed_afk,
-                    EconomyConfig.AFK_CHECK_PERIOD_TICKS,
-                    EconomyConfig.AFK_CHECK_PERIOD_TICKS,
-                    owner
-                )
-            else:
-                afk_task_obj = Bukkit.getScheduler().runTaskTimer(
-                    plugin,
-                    AfkRunnable(owner),
-                    EconomyConfig.AFK_CHECK_PERIOD_TICKS,
-                    EconomyConfig.AFK_CHECK_PERIOD_TICKS
-                )
+            afk_task_obj = Bukkit.getScheduler().runTaskTimer(
+                plugin,
+                AfkRunnable(owner),
+                EconomyConfig.AFK_CHECK_PERIOD_TICKS,
+                EconomyConfig.AFK_CHECK_PERIOD_TICKS
+            )
             try:
                 afk_task_id = afk_task_obj.getTaskId()
             except Exception:
                 afk_task_id = -1
             _store_task_id_in_system_property(_SYS_PROP_AFK_TASK, afk_task_id)
             log_info(u"Started AFK timer task (ID: {0}).".format(afk_task_id))
+            return True
         except Exception as e:
             log_error(u"Failed to start AFK timer: {0}".format(e))
+    else:
+        log_error(u"Failed to start AFK timer: PySpigot plugin not found.")
+    return False
 
 
 def stop_afk_timer():
@@ -1735,24 +1877,27 @@ def stop_afk_timer():
 
 def start_hud_timer():
     global hud_task_id, hud_task_obj
-    stop_hud_timer()
     _cancel_stale_task_by_system_property(_SYS_PROP_HUD_TASK)
+    stop_hud_timer()
     plugin = get_pyspigot_plugin()
     if plugin:
         try:
             owner = EconomyManager()
-            if PYSPIGOT_MANAGERS_AVAILABLE:
-                hud_task_obj = _pyspigot.task_manager().scheduleRepeatingTask(run_managed_hud, 200, 200, owner)
-            else:
-                hud_task_obj = Bukkit.getScheduler().runTaskTimer(plugin, HudRunnable(owner), 200, 200)
+            hud_task_obj = Bukkit.getScheduler().runTaskTimer(
+                plugin, HudRunnable(owner), 200, 200
+            )
             try:
                 hud_task_id = hud_task_obj.getTaskId()
             except Exception:
                 hud_task_id = -1
             _store_task_id_in_system_property(_SYS_PROP_HUD_TASK, hud_task_id)
             log_info(u"Started HUD timer task (ID: {0}).".format(hud_task_id))
+            return True
         except Exception as e:
             log_error(u"Failed to start HUD timer: {0}".format(e))
+    else:
+        log_error(u"Failed to start HUD timer: PySpigot plugin not found.")
+    return False
 
 
 def stop_hud_timer():
@@ -1824,7 +1969,9 @@ def register_event_directly(event_class, handler_func):
         return False
     try:
         if PYSPIGOT_MANAGERS_AVAILABLE:
-            listener = _pyspigot.listener_manager().registerListener(handler_func, event_class, "HIGHEST")
+            listener = _pyspigot.listener_manager().registerListener(
+                handler_func, event_class, EventPriority.HIGHEST
+            )
             registered_listeners.append(("managed", listener))
             return True
 
@@ -2046,6 +2193,7 @@ def on_player_join(event):
         log_error(u"Error in PlayerJoinEvent: {0}".format(e))
         import traceback
         traceback.print_exc()
+        raise
 
 
 def on_player_quit(event):
@@ -2128,11 +2276,21 @@ def parse_cmd_args(*args):
     if len(args) == 1:
         return sender, []
 
-    last_arg = args[-1]
-    if isinstance(last_arg, (list, tuple)):
-        return sender, [to_unicode(a) for a in last_arg]
+    # PySpigot 0.9.1 passes (sender, label, java.lang.String[]). A Java array
+    # is iterable in Jython but is not a Python list/tuple. Prefer the last
+    # non-string iterable and never treat the command label as an argument.
+    string_types = (str, unicode, JavaString)
+    for value in reversed(args[1:]):
+        if isinstance(value, string_types):
+            continue
+        try:
+            return sender, [to_unicode(item) for item in value]
+        except (TypeError, AttributeError):
+            pass
 
-    return sender, [to_unicode(a) for a in args[1:]]
+    # Compatibility with old/third-party dispatchers that flatten arguments.
+    start = 2 if len(args) >= 3 and isinstance(args[1], string_types) else 1
+    return sender, [to_unicode(value) for value in args[start:]]
 
 
 def cmd_balance(*args):
@@ -2640,7 +2798,7 @@ else:
 
 def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
     if not BUKKIT_AVAILABLE:
-        return
+        return False
     try:
         server = Bukkit.getServer()
         cmap = None
@@ -2670,7 +2828,7 @@ def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
                     except Exception:
                         curr_cls = curr_cls.getSuperclass()
 
-            if known_commands:
+            if known_commands is not None:
                 name = cmd_obj.getName().lower()
 
                 keys_to_remove = []
@@ -2702,9 +2860,11 @@ def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
                     alias_cmd = PyBukkitCommand(a_str, cmd_obj.getDescription(), cmd_obj.getUsage(), [], cmd_obj.executor, cmd_obj.completer)
                     known_commands.put(a_str, alias_cmd)
                     known_commands.put(fallback_prefix + ":" + a_str, alias_cmd)
+                return True
 
     except Exception as e:
         log_error(u"Error force-registering Bukkit command: {0}".format(e))
+    return False
 
 
 registered_economy_commands = []   # (name, aliases) - для полного снятия при выгрузке,
@@ -2797,25 +2957,21 @@ def register_economy_commands():
 
     for item in commands_def:
         name, desc, usage, aliases, handler, tab_handler = item[0], item[1], item[2], item[3], item[4], item[5]
-        # Remove commands left behind by old versions before registering the
-        # managed replacements that PySpigot owns and unloads automatically.
+        # Direct Bukkit registration is deliberate. PySpigot 0.9.1 has several
+        # overloaded registerCommand signatures; Jython can select a wrong one
+        # without a useful error, leaving /bal and /hud unusable after reload.
         force_unregister_bukkit_command("smarty-economy", name, aliases)
-        if PYSPIGOT_MANAGERS_AVAILABLE:
-            if tab_handler is None:
-                command_obj = _pyspigot.command_manager().registerCommand(
-                    handler, name, desc, usage, build_java_list(aliases)
-                )
-            else:
-                command_obj = _pyspigot.command_manager().registerCommand(
-                    handler, tab_handler, name, desc, usage, build_java_list(aliases)
-                )
-            managed_economy_commands.append(command_obj)
-        else:
-            cmd_obj = PyBukkitCommand(name, desc, usage, aliases, handler, tab_handler)
-            force_register_bukkit_command("smarty-economy", cmd_obj, aliases)
+        cmd_obj = PyBukkitCommand(name, desc, usage, aliases, handler, tab_handler)
+        if not force_register_bukkit_command("smarty-economy", cmd_obj, aliases):
+            raise RuntimeError("could not register /{0} in Bukkit CommandMap".format(name))
         registered_economy_commands.append((name, aliases))
 
-    log_info(u"Economy commands registered through PySpigot command manager with tab completion.")
+    try:
+        if BUKKIT_AVAILABLE and hasattr(Bukkit.getServer(), "syncCommands"):
+            Bukkit.getServer().syncCommands()
+    except Exception as e:
+        log_error(u"Could not synchronize economy commands: {0}".format(e))
+    log_info(u"Economy commands registered directly in Bukkit CommandMap with tab completion.")
 
 
 # -----------------------------------------------------------------------------
@@ -2851,14 +3007,20 @@ def on_enable():
 
         if BUKKIT_AVAILABLE:
             capture_default_sleep_rules()
-            register_event_directly(PlayerJoinEvent, on_player_join)
-            register_event_directly(PlayerQuitEvent, on_player_quit)
-            register_event_directly(PlayerMoveEvent, on_player_move)
-            register_event_directly(PlayerInteractEvent, on_player_activity)
-            register_event_directly(PlayerCommandPreprocessEvent, on_player_command)
-            register_event_directly(AsyncPlayerChatEvent, on_player_activity)
+            required_events = [
+                (PlayerJoinEvent, on_player_join),
+                (PlayerQuitEvent, on_player_quit),
+                (PlayerMoveEvent, on_player_move),
+                (PlayerInteractEvent, on_player_activity),
+                (PlayerCommandPreprocessEvent, on_player_command),
+            ]
+            if AsyncPlayerChatEvent is not None:
+                required_events.append((AsyncPlayerChatEvent, on_player_activity))
             if InventoryClickEvent is not None:
-                register_event_directly(InventoryClickEvent, on_player_activity)
+                required_events.append((InventoryClickEvent, on_player_activity))
+            for event_class, event_handler in required_events:
+                if not register_event_directly(event_class, event_handler):
+                    raise RuntimeError("could not register event {0}".format(event_class))
             log_info(u"Economy events registered through PySpigot listener manager.")
             # При /ps reload игроки не получают новый PlayerJoinEvent. Фиксируем,
             # что они уже онлайн, чтобы будущий рестарт не считал время от старого входа.
@@ -2866,9 +3028,12 @@ def on_enable():
 
         register_economy_commands()
         reset_online_payday_checks()
-        start_payday_timer()
-        start_afk_timer()
-        start_hud_timer()
+        if not start_payday_timer():
+            raise RuntimeError("payday timer did not start")
+        if not start_afk_timer():
+            raise RuntimeError("AFK timer did not start")
+        if not start_hud_timer():
+            raise RuntimeError("HUD timer did not start")
         log_info(u"{0} successfully enabled and ready!".format(EconomyConfig.PLUGIN_NAME))
     except Exception as e:
         log_error(u"Critical error in economy on_enable: {0}".format(e))
