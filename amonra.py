@@ -110,8 +110,8 @@ CD_ULT         = 5 * 60 * 20
 
 # Способности
 BEAM_DURATION       = 10 * 20
-BEAM_TICK_INTERVAL  = 10       # каждые 10 тиков
-BEAM_TICK_DAMAGE    = 1.0      # 0.5 сердца чистого
+BEAM_TICK_INTERVAL  = 20       # раз в секунду
+BEAM_TICK_DAMAGE    = 2.5      # 2.5 сердца чистого урона за попадание
 BEAM_RANGE          = 20.0
 BEAM_FIRE_TICKS     = 40       # 2 сек горения
 
@@ -168,6 +168,7 @@ E_REGEN       = _effect("regeneration")
 E_WEAKNESS    = _effect("weakness")
 E_HUNGER      = _effect("hunger")
 E_BLINDNESS   = _effect("blindness")
+E_FIRE_RESIST = _effect("fire_resistance")
 
 ENC_SHARP     = _enchant("sharpness")
 ENC_KNOCKBACK = _enchant("knockback")
@@ -856,6 +857,11 @@ def _passives_tick():
             u = uid(pl)
             world = pl.getWorld()
 
+            # Солнечная природа Амон-Ра: постоянная огнестойкость без частиц.
+            # Эффект обновляется раз в секунду и имеет небольшой запас времени,
+            # поэтому не мигает при кратковременной просадке TPS.
+            add_effect(pl, E_FIRE_RESIST, 60, 0, ambient=True, particles=False)
+
             # --- Благословение Ра: день + под открытым небом ---
             try:
                 env = world.getEnvironment().name()
@@ -1118,15 +1124,7 @@ _tier_reg.put("amonra", _amonra_set_tier)
 
 # --- Публикация в каталог Зеркала Души Арчера ---
 def _amonra_mirror_nur(owner_uuid):
-    # Для Зеркала копируем базовый T1 (без Fire Aspect и высоких зачарований —
-    # зеркальная копия должна быть слабее оригинала).
-    mat = TIER_MATERIALS.get(1, Material.TRIDENT)
-    it = ItemStack(mat, 1)
-    m = it.getItemMeta()
-    m.setDisplayName(u"§eКопьё Нур §7(зеркало)")
-    if ENC_SHARP: m.addEnchant(ENC_SHARP, 2, True)
-    it.setItemMeta(m)
-    return it
+    return create_nur(2, owner_uuid)
 
 _MIRROR_CATALOG_KEY = "archer.mirror_catalog"
 _mirror_cat = _props.get(_MIRROR_CATALOG_KEY)

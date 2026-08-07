@@ -63,11 +63,12 @@ from java.lang import System
 from java.util import UUID as JUUID
 
 from org.bukkit import Bukkit, Material, Particle, Sound, GameMode
+from org.bukkit.boss import BarColor, BarStyle
 from org.bukkit.block import BlockFace
 from org.bukkit.util import Vector
 from org.bukkit.entity import Player, LivingEntity, ArmorStand, Pose
 from org.bukkit.event import EventPriority
-from org.bukkit.event.player import PlayerQuitEvent, PlayerMoveEvent
+from org.bukkit.event.player import PlayerQuitEvent, PlayerMoveEvent, PlayerCommandPreprocessEvent, PlayerToggleFlightEvent
 from org.bukkit.event.entity import EntityDamageEvent, EntityDismountEvent
 
 # -------------------------------------------------------------------------
@@ -167,92 +168,73 @@ def _clear_other_states(player, keep):
 # =========================================================================
 # /pee - НАПРАВЛЕННАЯ СТРУЯ С ФИЗИКОЙ (ПАРАБОЛА, РАДИУС ~3.5 БЛОКА)
 # =========================================================================
-PEE_RADIUS = 3.5             # максимальная дальность струи в блоках
-PEE_GRAVITY = 1.05           # коэффициент "тяжести" осевой дуги (естественный изгиб струи вниз)
-PEE_STREAM_SPEED = 3.1       # условная скорость струи вдоль дуги
-PEE_STEPS = 34               # число расчётных точек дуги (с запасом на дальность)
 PEE_TICK_INTERVAL = 2        # анимация обновляется раз в 2 тика (~0.1 сек)
-PEE_WAVE_AMPLITUDE = 0.22    # амплитуда синусоиды (вертикальный размах волны, в блоках)
-PEE_WAVE_LENGTH = 1.1        # "длина волны" синусоиды вдоль струи (в блоках пройденного пути)
-PEE_WAVE_FLOW_SPEED = 0.55   # скорость "перетекания" волны по времени (делает эффект живым)
-_pee_phase_clock = [0.0]     # непрерывный накопитель фазы волны (не завязан на now_tick() % N,
-                             # чтобы не было разрывов синусоиды на границе модуля)
 
 
 def _draw_pee_stream(player):
+    """Draw one gaze-controlled ballistic arc (no repeating sine wave)."""
     loc = player.getLocation()
     world = player.getWorld()
     from org.bukkit import Color
 
-    # Направление струи в плоскости XZ - строго туда, куда смотрит игрок по горизонтали.
-    direction = loc.getDirection().clone()
-    direction.setY(0.0)
-    if direction.lengthSquared() < 1e-6:
-        direction = Vector(0.0, 0.0, 1.0)
-    direction.normalize()
+    aim = loc.getDirection().clone()
+    if aim.lengthSquared() < 1e-6:
+        aim = Vector(0.0, 0.0, 1.0)
+    aim.normalize()
 
-    pitch_rad = math.radians(loc.getPitch())
-    vertical_aim = -math.sin(pitch_rad)   # управление базовым углом струи взглядом вверх/вниз
+    # The source is near the waist. Full pitch is deliberately preserved:
+    # looking straight up sends the arc through the player's face before it falls.
+    horizontal_hint = Vector(aim.getX(), 0.0, aim.getZ())
+    if horizontal_hint.lengthSquared() > 1e-6:
+        horizontal_hint.normalize().multiply(0.24)
+    origin = loc.clone().add(horizontal_hint)
+    origin.setY(loc.getY() + 0.82)
 
-    origin = loc.clone().add(direction.clone().multiply(0.35))
-    origin.setY(loc.getY() + 0.9)   # примерная высота "пояса"
-
+    launch_speed = 3.65
+    gravity = 5.8
+    # A small upward impulse gives a readable single arc when looking forward;
+    # pitch then raises/lowers it. Looking straight up still sends it through
+    # the face line, but the clamp keeps the effect compact.
+    vertical_speed = max(-1.5, min(4.4, aim.getY() * launch_speed + 2.25))
+    max_time = 1.65
+    steps = 44
     color = Color.fromRGB(214, 200, 60)
     dust_opts = Particle.DustOptions(color, 0.55)
+    previous = origin.clone()
+    hit = False
 
-    # Непрерывный сдвиг фазы во времени - каждый вызов анимации волна "перетекает"
-    # дальше, а не начинается заново с нуля (эффект живой текущей струи).
-    _pee_phase_clock[0] += PEE_WAVE_FLOW_SPEED
-    time_phase = _pee_phase_clock[0]
+    for i in range(1, steps + 1):
+        t = max_time * float(i) / float(steps)
+        displacement = Vector(aim.getX() * launch_speed * t,
+                              vertical_speed * t,
+                              aim.getZ() * launch_speed * t)
+        point = origin.clone().add(displacement)
+        point.setY(point.getY() - 0.5 * gravity * t * t)
 
-    prev_point = origin.clone()
-    hit_something = False
-    for i in range(1, PEE_STEPS + 1):
-        t = i * 0.045
-        horiz = PEE_STREAM_SPEED * t
-        if horiz > PEE_RADIUS:
+        # Stop after the returning branch reaches the source height; this keeps
+        # the effect a single large arc instead of an endless falling trace.
+        if t > max(0.12, vertical_speed / gravity) and point.getY() < origin.getY() - 0.18:
+            _pee_splash(world, previous, color)
+            hit = True
             break
-        drop = 0.5 * PEE_GRAVITY * t * t
-
-        # Синусоида ПО ВЕРТИКАЛИ (вверх-вниз), наложенная на базовую нисходящую дугу
-        # струи - именно так физически "гуляет" реальная струя жидкости под напором,
-        # а не виляет вбок. Аргумент зависит от пройденного пути (horiz) - задаёт саму
-        # волну в пространстве вдоль направления взгляда, плюс от time_phase - заставляет
-        # её "течь" вперёд со временем. Амплитуда чуть затухает к концу дистанции.
-        wave_arg = (2.0 * math.pi / PEE_WAVE_LENGTH) * horiz + time_phase
-        taper = 1.0 - 0.3 * (horiz / PEE_RADIUS)
-        vertical_wave = PEE_WAVE_AMPLITUDE * taper * math.sin(wave_arg)
-
-        # Точка идёт строго по прямой в горизонтальной плоскости вдоль взгляда игрока
-        # (никакого бокового смещения), а синусоида добавляется только к высоте струи
-        # поверх параболического падения под гравитацией.
-        point = origin.clone().add(direction.clone().multiply(horiz))
-        point.setY(origin.getY() + vertical_aim * horiz * 0.6 - drop + vertical_wave)
 
         block = point.getBlock()
         try:
-            block_type = block.getType()
-            solid = block_type.isSolid()
-            liquid = block_type.isLiquid()
+            blocked = block.getType().isSolid() or block.getType().isLiquid()
         except Exception:
-            solid = False
-            liquid = False
-
-        if solid or liquid:
-            _pee_splash(world, prev_point, color)
-            hit_something = True
+            blocked = False
+        if blocked:
+            _pee_splash(world, previous, color)
+            hit = True
             break
-
         try:
-            world.spawnParticle(Particle.DUST, point, 2, 0.03, 0.03, 0.03, 0.0, dust_opts)
+            world.spawnParticle(Particle.DUST, point, 2, 0.025, 0.025, 0.025, 0.0, dust_opts)
         except Exception:
             pass
-        prev_point = point.clone()
+        previous = point.clone()
 
-    if not hit_something:
-        # Долетела до предела дальности, не встретив препятствий - лёгкий всплеск в воздухе
-        _pee_splash(world, prev_point, color)
-
+    if not hit:
+        _pee_splash(world, previous, color)
     if random.random() < 0.25:
         try:
             world.playSound(origin, Sound.ITEM_BUCKET_EMPTY, 0.15, 1.8)
@@ -911,6 +893,280 @@ def on_lay_command(sender, label, args):
     return True
 
 
+# =========================================================================
+# TEMPORARY ROLEPLAY ZONES
+# =========================================================================
+RP_ZONE_DEFAULT_RADIUS = 12.0
+RP_ZONE_MAX_RADIUS = 40.0
+RP_ZONE_LIFETIME_TICKS = 2 * 60 * 60 * 20
+RP_INVITE_COOLDOWN_TICKS = 60 * 20
+RP_BLOCKED_COMMANDS = set([
+    "fly", "gamemode", "gm", "tp", "teleport", "tpa", "tpaccept", "tpahere",
+    "home", "sethome", "spawn", "warp", "back", "rtp", "randomtp", "vanish",
+    "heal", "feed", "repair", "arena", "duel", "casino"
+])
+
+rp_zones = {}              # id -> live zone
+rp_zone_sequence = [1]
+rp_invite_cooldowns = {}   # player_uuid:zone_id -> end tick
+
+
+def _zone_contains(zone, location, margin=0.0):
+    if not zone or not location or location.getWorld() != zone["center"].getWorld():
+        return False
+    dx = location.getX() - zone["center"].getX()
+    dz = location.getZ() - zone["center"].getZ()
+    radius = float(zone["radius"]) + float(margin)
+    return dx * dx + dz * dz <= radius * radius and abs(location.getY() - zone["center"].getY()) <= 12.0
+
+
+def _find_zone_for_player(player, require_member=False):
+    puid = uid(player)
+    for zone in rp_zones.values():
+        if _zone_contains(zone, player.getLocation()):
+            if not require_member or puid in zone["members"]:
+                return zone
+    return None
+
+
+def _send_zone_invite(player, zone):
+    player.sendMessage(u"§d§l[RP] §fВ зоне «§e%s§f» игроки ведут ролевую сцену." % zone["title"])
+    try:
+        from net.md_5.bungee.api.chat import TextComponent, ClickEvent, HoverEvent, ComponentBuilder
+        button = TextComponent(u"§a§l[ПРИСОЕДИНИТЬСЯ]")
+        button.setClickEvent(ClickEvent(ClickEvent.Action.RUN_COMMAND, "/rpzone join " + zone["id"]))
+        button.setHoverEvent(HoverEvent(HoverEvent.Action.SHOW_TEXT,
+                                       ComponentBuilder(u"§7Войти в RP-сцену и принять её правила").create()))
+        player.spigot().sendMessage(button)
+    except Exception:
+        player.sendMessage(u"§7Введите §a/rpzone join %s§7, чтобы присоединиться." % zone["id"])
+    try:
+        player.sendActionBar(u"§dRP-зона рядом §8• §f/rpzone join %s" % zone["id"])
+    except Exception:
+        pass
+
+
+def _refresh_zone_bar(zone):
+    bar = zone.get("bar")
+    if bar is None:
+        return
+    online_inside = []
+    for member_uuid in list(zone["members"]):
+        try:
+            member = Bukkit.getPlayer(JUUID.fromString(member_uuid))
+        except Exception:
+            member = None
+        if member and member.isOnline() and _zone_contains(zone, member.getLocation(), 1.0):
+            online_inside.append(member)
+    try:
+        bar.setTitle(u"§dRP: §f%s §8• §a%d участн." % (zone["title"], len(online_inside)))
+        remaining = max(0.0, float(zone["expires_tick"] - now_tick()) / float(RP_ZONE_LIFETIME_TICKS))
+        bar.setProgress(min(1.0, remaining))
+        bar.removeAll()
+        for member in online_inside:
+            bar.addPlayer(member)
+    except Exception:
+        pass
+
+
+def _end_rp_zone(zone_id, reason=None):
+    zone = rp_zones.pop(str(zone_id), None)
+    if not zone:
+        return False
+    try:
+        if zone.get("bar"):
+            zone["bar"].removeAll()
+    except Exception:
+        pass
+    if reason:
+        for member_uuid in list(zone["members"]):
+            try:
+                member = Bukkit.getPlayer(JUUID.fromString(member_uuid))
+                if member and member.isOnline():
+                    member.sendMessage(u"§d§l[RP] §7%s" % _to_unicode(reason))
+            except Exception:
+                pass
+    return True
+
+
+def _rp_zone_ticker():
+    try:
+        for zone_id, zone in list(rp_zones.items()):
+            if now_tick() >= zone["expires_tick"]:
+                _end_rp_zone(zone_id, u"RP-зона завершена по лимиту времени.")
+                continue
+            _refresh_zone_bar(zone)
+            center = zone["center"]
+            world = center.getWorld()
+            # 24 cheap points make the border readable without a heavy particle wall.
+            for index in range(24):
+                angle = 2.0 * math.pi * float(index) / 24.0
+                point = center.clone().add(math.cos(angle) * zone["radius"], 0.15,
+                                           math.sin(angle) * zone["radius"])
+                try:
+                    world.spawnParticle(Particle.END_ROD, point, 1, 0.0, 0.0, 0.0, 0.0)
+                except Exception:
+                    pass
+    except Exception as ex:
+        Bukkit.getLogger().warning("[rp_actions] RP-zone ticker error: " + str(ex))
+    scheduler.runTaskLater(_rp_zone_ticker, 20)
+
+
+def on_rpzone_command(sender, label, args):
+    if not isinstance(sender, Player):
+        sender.sendMessage(u"Команда доступна только игрокам.")
+        return True
+    sub = _norm(args[0]) if args and len(args) > 0 else u"info"
+    player_uuid = uid(sender)
+
+    if sub in [u"help", u"помощь", u"?"]:
+        sender.sendMessage(u"§d§lRP-зоны — команды")
+        sender.sendMessage(u"§e/rpzone create [радиус] [название] §7— создать сцену")
+        sender.sendMessage(u"§e/rpzone join <ID> §7— присоединиться к сцене")
+        sender.sendMessage(u"§e/rpzone list §7— участники вашей сцены")
+        sender.sendMessage(u"§e/rpzone info §7— сведения о зоне рядом")
+        sender.sendMessage(u"§e/rpzone leave §7— покинуть сцену")
+        sender.sendMessage(u"§e/rpzone end §7— завершить созданную вами сцену")
+        return True
+
+    if sub in [u"list", u"players", u"список", u"игроки"]:
+        zone = next((z for z in rp_zones.values() if player_uuid in z["members"]), None)
+        if zone is None and sender.hasPermission("roleplay.zone.admin") and len(args) > 1:
+            zone = rp_zones.get(str(args[1]))
+        if zone is None:
+            sender.sendMessage(u"§cВы не состоите в активной RP-зоне.")
+            return True
+        sender.sendMessage(u"§d§l[RP] §fУчастники зоны #%s «%s» §7(%d):" %
+                           (zone["id"], zone["title"], len(zone["members"])))
+        for member_uuid in list(zone["members"]):
+            member = None
+            name = member_uuid
+            try:
+                java_uuid = JUUID.fromString(member_uuid)
+                member = Bukkit.getPlayer(java_uuid)
+                if member is not None:
+                    name = member.getName()
+                else:
+                    offline = Bukkit.getOfflinePlayer(java_uuid)
+                    if offline is not None and offline.getName():
+                        name = offline.getName()
+            except Exception:
+                pass
+            if member is not None and member.isOnline():
+                status = u"§aв зоне" if _zone_contains(zone, member.getLocation(), 1.0) else u"§eвне зоны"
+            else:
+                status = u"§8не в сети"
+            owner_mark = u" §6[владелец]" if member_uuid == zone["owner_uuid"] else u""
+            sender.sendMessage(u" §8• §f%s%s §7— %s" % (name, owner_mark, status))
+        return True
+
+    if sub in [u"create", u"start", u"создать"]:
+        owned = next((z for z in rp_zones.values() if z["owner_uuid"] == player_uuid), None)
+        if owned:
+            sender.sendMessage(u"§cУ вас уже есть RP-зона #%s." % owned["id"])
+            return True
+        try:
+            radius = float(args[1]) if len(args) > 1 else RP_ZONE_DEFAULT_RADIUS
+        except Exception:
+            radius = RP_ZONE_DEFAULT_RADIUS
+        radius = max(5.0, min(RP_ZONE_MAX_RADIUS, radius))
+        title = u" ".join([_to_unicode(a) for a in args[2:]]).strip() if len(args) > 2 else u"Ролевая сцена"
+        zone_id = str(rp_zone_sequence[0])
+        rp_zone_sequence[0] += 1
+        try:
+            bar = Bukkit.createBossBar(u"§dRP: §f" + title, BarColor.PURPLE, BarStyle.SOLID)
+        except Exception:
+            bar = None
+        zone = {"id": zone_id, "owner_uuid": player_uuid, "owner_name": sender.getName(),
+                "title": title[:60], "center": sender.getLocation().clone(), "radius": radius,
+                "members": set([player_uuid]), "created_tick": now_tick(),
+                "expires_tick": now_tick() + RP_ZONE_LIFETIME_TICKS, "bar": bar}
+        rp_zones[zone_id] = zone
+        _refresh_zone_bar(zone)
+        sender.sendMessage(u"§aRP-зона #%s «%s» создана, радиус %.0f блоков." % (zone_id, title, radius))
+        sender.sendMessage(u"§7Игроки у границы получат приглашение. Завершить: §e/rpzone end")
+        return True
+
+    if sub in [u"join", u"accept", u"войти"] and len(args) > 1:
+        zone = rp_zones.get(str(args[1]))
+        if not zone or not _zone_contains(zone, sender.getLocation(), 6.0):
+            sender.sendMessage(u"§cRP-зона не найдена или вы слишком далеко.")
+            return True
+        another = next((z for z in rp_zones.values()
+                        if z["id"] != zone["id"] and player_uuid in z["members"]), None)
+        if another:
+            sender.sendMessage(u"§cСначала покиньте RP-зону #%s." % another["id"])
+            return True
+        zone["members"].add(player_uuid)
+        _refresh_zone_bar(zone)
+        sender.sendMessage(u"§aВы присоединились к RP-сцене «%s»." % zone["title"])
+        for member_uuid in zone["members"]:
+            if member_uuid == player_uuid:
+                continue
+            try:
+                member = Bukkit.getPlayer(JUUID.fromString(member_uuid))
+                if member and member.isOnline():
+                    member.sendMessage(u"§d§l[RP] §f%s §7присоединился к сцене." % sender.getName())
+            except Exception:
+                pass
+        return True
+
+    if sub in [u"leave", u"quit", u"выйти"]:
+        zone = next((z for z in rp_zones.values() if player_uuid in z["members"]), None)
+        if not zone:
+            sender.sendMessage(u"§cВы не участвуете в RP-сцене.")
+            return True
+        if zone["owner_uuid"] == player_uuid:
+            sender.sendMessage(u"§cВладелец должен использовать /rpzone end.")
+            return True
+        zone["members"].discard(player_uuid)
+        _refresh_zone_bar(zone)
+        sender.sendMessage(u"§7Вы покинули RP-сцену.")
+        return True
+
+    if sub in [u"end", u"stop", u"закончить"]:
+        zone = next((z for z in rp_zones.values() if z["owner_uuid"] == player_uuid), None)
+        if not zone and sender.hasPermission("roleplay.zone.admin") and len(args) > 1:
+            zone = rp_zones.get(str(args[1]))
+        if not zone:
+            sender.sendMessage(u"§cУ вас нет активной RP-зоны.")
+            return True
+        _end_rp_zone(zone["id"], u"RP-сцена завершена владельцем.")
+        return True
+
+    zone = _find_zone_for_player(sender, False)
+    if zone:
+        joined = u"да" if player_uuid in zone["members"] else u"нет"
+        sender.sendMessage(u"§dRP-зона #%s §f«%s» §7| владелец: §f%s §7| участник: §f%s" %
+                           (zone["id"], zone["title"], zone["owner_name"], joined))
+        if player_uuid not in zone["members"]:
+            sender.sendMessage(u"§7Присоединиться: §a/rpzone join %s" % zone["id"])
+    else:
+        sender.sendMessage(u"§7RP-зоны рядом нет. Создать: §e/rpzone create [радиус] [название]")
+    return True
+
+
+def on_rp_command_preprocess(event):
+    player = event.getPlayer()
+    if player.hasPermission("roleplay.zone.bypass"):
+        return
+    zone = _find_zone_for_player(player, True)
+    if not zone:
+        return
+    raw = _norm(event.getMessage()).lstrip(u"/")
+    command = raw.split(u" ", 1)[0].split(u":")[-1]
+    if command in RP_BLOCKED_COMMANDS:
+        event.setCancelled(True)
+        player.sendMessage(u"§d§l[RP] §cЭта команда отключена на время RP-сцены. Сначала: §e/rpzone leave")
+
+
+def on_rp_toggle_flight(event):
+    player = event.getPlayer()
+    if event.isFlying() and not player.hasPermission("roleplay.zone.bypass") and _find_zone_for_player(player, True):
+        event.setCancelled(True)
+        player.sendMessage(u"§d§l[RP] §cПолёт отключён внутри RP-сцены.")
+
+
 def on_player_move(event):
     """Единственный listener PlayerMoveEvent в скрипте: отслеживает движение лежащих
     игроков, чтобы вовремя переносить фейковый барьер над головой.
@@ -935,6 +1191,18 @@ def on_player_move(event):
         target_loc = event.getTo()
         if target_loc is not None:
             _lay_update_barrier(player, target_loc)
+
+    target_loc = event.getTo()
+    if target_loc is not None:
+        for zone in rp_zones.values():
+            if u in zone["members"]:
+                continue
+            if _zone_contains(zone, target_loc, 3.0):
+                invite_key = u + ":" + zone["id"]
+                if now_tick() >= rp_invite_cooldowns.get(invite_key, 0):
+                    rp_invite_cooldowns[invite_key] = now_tick() + RP_INVITE_COOLDOWN_TICKS
+                    _send_zone_invite(player, zone)
+                break
 
 
 # =========================================================================
@@ -1001,6 +1269,8 @@ def on_enable():
     listener_mgr.registerListener(on_entity_dismount, EntityDismountEvent)
     listener_mgr.registerListener(on_entity_damage, EntityDamageEvent)
     listener_mgr.registerListener(on_player_quit, PlayerQuitEvent)
+    listener_mgr.registerListener(on_rp_command_preprocess, PlayerCommandPreprocessEvent)
+    listener_mgr.registerListener(on_rp_toggle_flight, PlayerToggleFlightEvent)
     try:
         # HIGHEST + ignoreCancelled - как в эталонной реализации GSit (Crawl.java),
         # чтобы обновление барьера произошло максимально близко к финальной позиции
@@ -1015,18 +1285,25 @@ def on_enable():
         listener_mgr.registerListener(on_player_move, PlayerMoveEvent)
 
     _register_command(on_pee_command, "pee")
+    _register_command(on_pee_command, "p")
     _register_command(on_spit_command, "spit")
     _register_command(on_sit_command, "sit")
     _register_command(on_esit_command, "esit")
     _register_command(on_lay_command, "lay")
+    _register_command(on_rpzone_command, "rpzone")
+    _register_command(on_rpzone_command, "rp")
 
     scheduler.runTaskLater(_pee_ticker, PEE_TICK_INTERVAL)
     scheduler.runTaskLater(_esit_rotation_ticker, ESIT_ROTATE_INTERVAL)
+    scheduler.runTaskLater(_rp_zone_ticker, 20)
 
-    Bukkit.getLogger().info("[rp_actions] RP action commands loaded: /pee /spit /sit /esit /lay")
+    Bukkit.getLogger().info("[rp_actions] RP action commands loaded: /pee (/p) /spit /sit /esit /lay")
 
 
 def on_disable():
+    for zone_id in list(rp_zones.keys()):
+        _end_rp_zone(zone_id, u"RP-зона закрыта из-за перезагрузки скрипта.")
+    rp_invite_cooldowns.clear()
     for u in list(seat_stands.keys()):
         stand = seat_stands.pop(u, None)
         seat_return_loc.pop(u, None)
@@ -1061,6 +1338,11 @@ def on_disable():
     lay_barrier_loc.clear()
     peeing_players.clear()
     Bukkit.getLogger().info("[rp_actions] Disabled.")
+
+
+def stop(script=None):
+    # PySpigot 0.9.1 invokes stop() on unload; close bossbars and pose entities.
+    on_disable()
 
 
 on_enable()

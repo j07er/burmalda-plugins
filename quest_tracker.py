@@ -82,7 +82,7 @@ from org.bukkit.entity import (
 
     Player, LivingEntity, Wither, EnderDragon, Guardian, ElderGuardian,
 
-    Squid, Dolphin, Drowned
+    Squid, Dolphin, Drowned, EntityType
 
 )
 
@@ -328,7 +328,7 @@ def _save():
 
         except Exception: pass
 
-        text = json.dumps(progress, ensure_ascii=False, indent=2)
+        text = json.dumps(progress, ensure_ascii=True, indent=2)
 
         f = io.open(DATA_FILE, "w", encoding="utf-8")
 
@@ -344,9 +344,13 @@ def _save():
 
             f.close()
 
+        return True
+
     except Exception as ex:
 
         Bukkit.getLogger().warning("[quest_tracker] save: " + str(ex))
+
+        return False
 
 def _pdata(player_uuid):
 
@@ -485,6 +489,9 @@ ITEM_PDC_TO_HERO = {
     "steelgorn:axe":      "steelgorn",
 
     "wendy:wind_charge":  "wendy",
+    "akame:murasame":     "akame",
+    "luna:chrono_dagger": "luna",
+    "cthulhu:crimson_trident": "cthulhu",
 
 }
 
@@ -555,6 +562,8 @@ def _get_tier_from_inventory(player, hero_id):
         "steelgorn":  "steelgorn:tier",
 
         "amonra":     "amonra:tier",
+        "luna":       "luna:tier",
+        "cthulhu":    "cthulhu:tier",
 
     }
 
@@ -668,6 +677,12 @@ def _q(hero_id, qid, tier_from, tier_to, name, icon, tracked, steps):
 
     }
 
+def _qa(qid, ability_key, name, icon, steps):
+    """Квест-разблокировка способности: не меняет тир персонажа."""
+    q = _q("spider", qid, 0, 0, name, icon, True, steps)
+    q["ability_unlock"] = ability_key
+    return q
+
 def _s(key, needed, label, src="tracked"):
 
     return {"key": key, "needed": needed, "label": label, "src": src}
@@ -742,9 +757,67 @@ QUESTS["doom"] = [
 
 ]
 
-# Spider — прогрессии нет по дизайну.
+# Luna: both counters use the total number of mob kills.  This means that the
+# 650-kill requirement for tier III includes the first 350 kills from tier I.
+QUESTS["luna"] = [
+    _q("luna", "luna_t2", 1, 2, u"Серебряный Хроно-Клинок", Material.IRON_SWORD, True, [
+        _s("mob_kills", 350, u"Убить мобов"),
+    ]),
+    _q("luna", "luna_t3", 2, 3, u"Незеритовый Разломатель Эпох", Material.NETHERITE_SWORD, True, [
+        _s("mob_kills", 650, u"Убить мобов"),
+    ]),
+]
 
-QUESTS["spider"] = []
+# Cthulhu's second tier is an automatic drowned hunt.  Tier III intentionally
+# stays non-automatic: the required separate administration quest has not been
+# specified, so an administrator awards it through the tier control UI.
+QUESTS["cthulhu"] = [
+    _q("cthulhu", "cthulhu_t2", 1, 2, u"Зов Утопленников", Material.DROWNED_SPAWN_EGG, True, [
+        _s("drowned_kills", 50, u"Убить утопленников"),
+    ]),
+    _q("cthulhu", "cthulhu_t3", 2, 3, u"Пробуждение Багровой Пучины", Material.TRIDENT, False, [
+        _s("admin_quest", 1, u"Выполнить отдельный квест администрации", src="admin"),
+    ]),
+]
+
+# Spider — независимые квесты, открывающие способности вместо повышения тира.
+
+QUESTS["spider"] = [
+    _qa("spider_mace", "mace", u"Паутинная булава", Material.IRON_BLOCK, [
+        _s("string", 36, u"Нити", src="inv"),
+        _s("iron_block", 3, u"Железные блоки", src="inv"),
+    ]),
+    _qa("spider_dodge", "dodge", u"Уворот", Material.SHIELD, [
+        _s("progress", 10, u"Заблокировать атак щитом"),
+    ]),
+    _qa("spider_trap", "trap", u"Паутинное шенбяо", Material.TRIPWIRE_HOOK, [
+        _s("progress", 10, u"Запустить раздатчик растяжкой"),
+    ]),
+    _qa("spider_lunge", "lunge", u"Паучий выпад", Material.MACE, [
+        _s("progress", 15, u"Ударить игрока булавой в падении"),
+    ]),
+    _qa("spider_wings", "wings", u"Паучьи крылья", Material.ELYTRA, [
+        _s("progress", 1, u"Упасть на 200 блоков без урона"),
+    ]),
+    _qa("spider_drone", "drone", u"Паучий дрон", Material.VEX_SPAWN_EGG, [
+        _s("progress", 5, u"Убить вызывателей"),
+    ]),
+    _qa("spider_bounce", "bounce", u"Паучий отскок", Material.LEAD, [
+        _s("progress", 20, u"Притянуть сущностей паутинной нитью"),
+    ]),
+    _qa("spider_cocoon", "cocoon", u"Паучий кокон", Material.COBWEB, [
+        _s("progress", 10, u"Использовать Паучьи рефлексы"),
+    ]),
+    _qa("spider_hurricane", "hurricane", u"Паутинный ураган", Material.WIND_CHARGE, [
+        _s("progress", 15, u"Оттолкнуть сущностей ударной паутиной"),
+    ]),
+    _qa("spider_gravity", "gravity", u"Гравиколодец", Material.POTION, [
+        _s("progress", 40, u"Подняться с левитацией на 40 блоков"),
+    ]),
+    _qa("spider_horizon", "horizon", u"Паутинный горизонт", Material.TNT, [
+        _s("progress", 32, u"Поджечь 32 блока TNT"),
+    ]),
+]
 
 # Archer: kills мечом.
 
@@ -1060,6 +1133,18 @@ QUESTS["amonra"]  = [
 
 QUESTS["wendy"]   = []
 
+QUESTS["akame"] = [
+    _q("akame", "akame_t2", 1, 2, u"Пробуждение Мурасаме",
+       Material.STONE_SWORD, True, [
+        _s("kills", 350, u"Убить мобов мечом", src="akame_stat"),
+    ]),
+    _q("akame", "akame_t3", 2, 3, u"Клинок убийцы",
+       Material.DIAMOND_SWORD, True, [
+        _s("kills", 750, u"Убить мобов мечом", src="akame_stat"),
+        _s("types", 15, u"Убить уникальных видов мобов", src="akame_stat"),
+    ]),
+]
+
 # ============================================================================
 
 #  ЧТЕНИЕ СЧЁТЧИКОВ ИЗ ВНЕШНИХ ИСТОЧНИКОВ (VISUAL)
@@ -1104,6 +1189,27 @@ def _read_ancient_debris(player):
 
     return a + b
 
+def _get_akame_stat(player, key):
+    try:
+        p_uuid = uid(player)
+        akame_file = os.path.join(DATA_DIR, "akame.json")
+        if os.path.exists(akame_file):
+            with open(akame_file, "r") as f:
+                data = json.load(f)
+                if p_uuid in data:
+                    entry = data[p_uuid]
+                    tier = entry.get("tier", 1)
+                    kills = entry.get("kills", 0)
+                    mob_types_str = entry.get("mob_types", "")
+                    if key == "kills":
+                        return kills
+                    if key == "types":
+                        types_list = [t for t in mob_types_str.split(",") if t]
+                        return len(types_list)
+    except Exception:
+        pass
+    return 0
+
 def _get_step_value(player, hero_id, quest_id, step):
 
     """Возвращает текущее значение счётчика шага."""
@@ -1111,6 +1217,9 @@ def _get_step_value(player, hero_id, quest_id, step):
     key = step["key"]
 
     src = step.get("src", "tracked")
+
+    if src == "akame_stat":
+        return _get_akame_stat(player, key)
 
     if src == "tracked":
 
@@ -1173,6 +1282,9 @@ def _get_step_value(player, hero_id, quest_id, step):
 # ============================================================================
 
 def _quest_completed(player, hero_id, quest):
+
+    if quest.get("ability_unlock") and _qdata(uid(player), quest["id"]).get("_completed"):
+        return True
 
     for st in quest["steps"]:
 
@@ -1281,6 +1393,18 @@ def _check_and_upgrade(player, hero_id, quest_id):
 
             return
 
+        # Квесты Паука открывают механику, а не новый тир.
+        if q.get("ability_unlock"):
+            if _quest_completed(player, hero_id, q):
+                qd["_completed"] = True
+                _save()
+                player.sendMessage(u"§a§l✓ Открыта способность: §f" + q["name"])
+                try:
+                    player.getWorld().playSound(player.getLocation(),
+                        Sound.UI_TOAST_CHALLENGE_COMPLETE, 1.0, 1.2)
+                except Exception: pass
+            return
+
         # 2. Игрок уже на нужном или более высоком тире — квест устарел.
 
         cur_tier = _get_tier_from_inventory(player, hero_id)
@@ -1331,6 +1455,19 @@ def api_increment(quest_id, player, amount=1, key=None):
 
         hero_id = _detect_hero(player)
 
+        # Hero scripts can report progress before their owner registry is
+        # published during reload. The quest id itself is an unambiguous
+        # fallback, so completion must not depend on plugin load order.
+        if not hero_id:
+
+            for candidate_id, candidate_quests in QUESTS.items():
+
+                if any(q.get("id") == quest_id for q in candidate_quests):
+
+                    hero_id = candidate_id
+
+                    break
+
         if hero_id:
 
             _check_and_upgrade(player, hero_id, quest_id)
@@ -1353,6 +1490,27 @@ def api_progress(player):
 
         return {}
 
+def api_ability_unlocked(player, hero_id, ability_key):
+    """Проверяет постоянную разблокировку; ресурсные шаги завершает на лету."""
+    try:
+        for quest in QUESTS.get(str(hero_id), []):
+            if quest.get("ability_unlock") != str(ability_key): continue
+            qd = _qdata(uid(player), quest["id"])
+            if qd.get("_completed"): return True
+            if _quest_completed(player, str(hero_id), quest):
+                qd["_completed"] = True
+                _save()
+                player.sendMessage(u"§a§l✓ Открыта способность: §f" + quest["name"])
+                try:
+                    player.getWorld().playSound(player.getLocation(),
+                        Sound.UI_TOAST_CHALLENGE_COMPLETE, 1.0, 1.2)
+                except Exception: pass
+                return True
+            return False
+    except Exception as ex:
+        Bukkit.getLogger().warning("[quest_tracker] ability_unlocked: " + str(ex))
+    return False
+
 def api_register_stat(hero_id, fn):
 
     """Героям с VISUAL-квестами: регистрируют функцию (player, key) -> int
@@ -1366,6 +1524,44 @@ def api_register_stat(hero_id, fn):
     except Exception:
 
         pass
+
+def _migrate_legacy_spider_quests():
+    """Однократно переносит agent_spider_quests.json в общее хранилище."""
+    legacy_file = os.path.join(DATA_DIR, "agent_spider_quests.json")
+    if not os.path.exists(legacy_file): return
+    try:
+        f = io.open(legacy_file, "r", encoding="utf-8")
+        try: legacy = json.load(f)
+        finally: f.close()
+        if not isinstance(legacy, dict): return
+        goals = {
+            "mace":39, "dodge":10, "trap":10, "lunge":15, "wings":1,
+            "drone":5, "bounce":20, "cocoon":10, "hurricane":15,
+            "gravity":40, "horizon":32,
+        }
+        changed = False
+        for player_uuid, old_record in legacy.items():
+            if not isinstance(old_record, dict): continue
+            old_progress = old_record.get("progress", {})
+            old_unlocked = set(old_record.get("unlocked", []))
+            for ability_key, goal in goals.items():
+                qd = _qdata(player_uuid, "spider_" + ability_key)
+                old_value = int(old_progress.get(ability_key, 0))
+                if ability_key != "mace" and old_value > qd.get("progress", 0):
+                    qd["progress"] = min(goal, old_value)
+                    changed = True
+                if ability_key in old_unlocked or old_value >= goal:
+                    if not qd.get("_completed"):
+                        qd["_completed"] = True
+                        if ability_key != "mace": qd["progress"] = goal
+                        changed = True
+        if changed and not _save(): return
+        migrated_file = legacy_file + ".migrated"
+        if not os.path.exists(migrated_file):
+            os.rename(legacy_file, migrated_file)
+        Bukkit.getLogger().info("[quest_tracker] Agent Spider quests migrated.")
+    except Exception as ex:
+        Bukkit.getLogger().warning("[quest_tracker] spider migration: " + str(ex))
 
 # ============================================================================
 
@@ -1733,6 +1929,24 @@ def on_death(event):
 
         _save()
 
+    # === LUNA ===
+    # Only mob kills with the Chrono Dagger in the main hand count. Both quest
+    # counters advance together, since tier III is 650 total kills, not +650.
+    if hero_id == "luna":
+        if not isinstance(victim, Player) and _has_hero_item_in_hand(killer, "luna"):
+            _inc(killer_uid, "luna_t2", "mob_kills", 1)
+            _inc(killer_uid, "luna_t3", "mob_kills", 1)
+            _check_and_upgrade(killer, hero_id, "luna_t2")
+            _check_and_upgrade(killer, hero_id, "luna_t3")
+            _save()
+
+    # === CTHULHU ===
+    if hero_id == "cthulhu":
+        if victim.getType() == EntityType.DROWNED and _has_hero_item_in_hand(killer, "cthulhu"):
+            _inc(killer_uid, "cthulhu_t2", "drowned_kills", 1)
+            _check_and_upgrade(killer, hero_id, "cthulhu_t2")
+            _save()
+
 def _is_solo(killer, radius=20.0):
 
     """Проверяет: рядом с убийцей нет других игроков (только жертва)."""
@@ -2099,6 +2313,12 @@ def open_quests_gui(viewer, target=None):
 
     quests_all = QUESTS.get(hero_id, [])
 
+    # Ресурсные квесты способностей завершаются при открытии общего GUI.
+    if hero_id == "spider":
+        for ability_quest in quests_all:
+            ability_key = ability_quest.get("ability_unlock")
+            if ability_key: api_ability_unlocked(target, hero_id, ability_key)
+
     cur_tier = _get_tier_from_inventory(target, hero_id)
 
     # Заголовочная плитка.
@@ -2115,7 +2335,8 @@ def open_quests_gui(viewer, target=None):
 
         "warden": u"Варден", "dragon": u"Дракон", "amonra": u"Амон-Ра",
 
-        "shaman": u"Шаман", "steelgorn": u"Стальгорн", "wendy": u"Венди",
+        "shaman": u"Шаман", "steelgorn": u"Стальгорн", "wendy": u"Венди", "akame": u"Акаме",
+        "luna": u"Луна", "cthulhu": u"Ктулху",
 
     }
 
@@ -2125,17 +2346,15 @@ def open_quests_gui(viewer, target=None):
 
     m.setDisplayName(u"§b§l" + hero_names.get(hero_id, hero_id))
 
-    tier_str = str(cur_tier) if cur_tier is not None else u"?"
-
-    m.setLore(java_list([
-
-        u"§7Игрок: §f" + target.getName(),
-
-        u"§7Текущий тир: §fT" + tier_str,
-
-        u"§7Всего квестов: §f" + str(len(quests_all)),
-
-    ]))
+    header_lore = [u"§7Игрок: §f" + target.getName()]
+    if hero_id == "spider":
+        opened = sum(1 for q in quests_all if _quest_completed(target, hero_id, q))
+        header_lore.append(u"§7Открыто способностей: §f%d§7/§f%d" % (opened, len(quests_all)))
+    else:
+        tier_str = str(cur_tier) if cur_tier is not None else u"?"
+        header_lore.append(u"§7Текущий тир: §fT" + tier_str)
+    header_lore.append(u"§7Всего квестов: §f" + str(len(quests_all)))
+    m.setLore(java_list(header_lore))
 
     header.setItemMeta(m)
 
@@ -2187,9 +2406,11 @@ def open_quests_gui(viewer, target=None):
 
             prefix = u"§7[Закрыт] "   # ещё не открыт
 
-        m.setDisplayName(prefix + u"§f" + q["name"] + u" §8(T" +
-
-                         str(q["tier_from"]) + u"→T" + str(q["tier_to"]) + u")")
+        if q.get("ability_unlock"):
+            m.setDisplayName(prefix + u"§f" + q["name"])
+        else:
+            m.setDisplayName(prefix + u"§f" + q["name"] + u" §8(T" +
+                             str(q["tier_from"]) + u"→T" + str(q["tier_to"]) + u")")
 
         lore = []
 
@@ -2203,7 +2424,14 @@ def open_quests_gui(viewer, target=None):
 
         lore.append(u"")
 
-        if q.get("tracked"):
+        if q.get("ability_unlock"):
+
+            if _quest_completed(target, hero_id, q):
+                lore.append(u"§a[способность открыта]")
+            else:
+                lore.append(u"§8[разблокировка способности]")
+
+        elif q.get("tracked"):
 
             lore.append(u"§8[авто-улучшение]")
 
@@ -2415,6 +2643,8 @@ _props.put("quest_tracker.increment", api_increment)
 
 _props.put("quest_tracker.progress", api_progress)
 
+_props.put("quest_tracker.ability_unlocked", api_ability_unlocked)
+
 _props.put("quest_tracker.report_architect_pulse", api_report_architect_pulse)
 
 _props.put("quest_tracker.report_mihawk_great_slash", api_report_mihawk_great_slash)
@@ -2422,5 +2652,7 @@ _props.put("quest_tracker.report_mihawk_great_slash", api_report_mihawk_great_sl
 _props.put("quest_tracker.register_stat", api_register_stat)
 
 _load()
+
+_migrate_legacy_spider_quests()
 
 Bukkit.getLogger().info("[quest_tracker] Quest Tracker loaded. Command: /quests")

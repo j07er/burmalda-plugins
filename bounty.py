@@ -12,6 +12,7 @@ Commands:
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -28,17 +29,21 @@ except Exception:
     pass
 
 try:
-    from org.bukkit import Bukkit, ChatColor, Sound
+    from org.bukkit import Bukkit, ChatColor, Material, Sound
     from org.bukkit.command import Command, TabCompleter
     from org.bukkit.entity import Player
     from org.bukkit.event import EventPriority, HandlerList, Listener
     from org.bukkit.event.entity import PlayerDeathEvent
+    from org.bukkit.event.inventory import InventoryClickEvent, InventoryCloseEvent
+    from org.bukkit.event.player import PlayerJoinEvent
+    from org.bukkit.inventory import ItemStack
     from org.bukkit.plugin import EventExecutor
     BUKKIT_AVAILABLE = True
 except ImportError:
     Bukkit = None
     ChatColor = None
     Sound = None
+    Material = None
     Command = object
     TabCompleter = object
     Player = object
@@ -46,6 +51,10 @@ except ImportError:
     HandlerList = None
     Listener = object
     PlayerDeathEvent = None
+    InventoryClickEvent = None
+    InventoryCloseEvent = None
+    PlayerJoinEvent = None
+    ItemStack = None
     EventExecutor = object
     BUKKIT_AVAILABLE = False
 
@@ -228,19 +237,27 @@ class BountyConfig(object):
     SURVIVAL_BOUNTY_PER_STREAK = 100.0
     MAX_SURVIVAL_BOUNTY_PER_INTERVAL = 2000.0
     RECENT_KILL_COOLDOWN_SECONDS = 600
+    BOUNTY_EXPIRE_SECONDS = 7 * 24 * 60 * 60
     LIST_PAGE_SIZE = 8
+    HISTORY_LIMIT = 200
+    NOTIFICATION_LIMIT = 30
 
     DEFAULT_STATE = {
         "bounties": {},
         "kill_streaks": {},
-        "recent_kills": {}
+        "recent_kills": {},
+        "pending_payouts": {},
+        "notifications": {},
+        "history": []
     }
 
 
 class JsonStorage(object):
     def __init__(self, path, defaults):
         self.path = path
+        self.backup_path = path + ".bak"
         self.defaults = defaults
+        self.primary_valid = not os.path.exists(path)
 
     def load(self):
         self.ensure_dir()
@@ -248,25 +265,52 @@ class JsonStorage(object):
             return self.merge_defaults({})
         try:
             with open(self.path, "r") as handle:
-                return self.merge_defaults(json.load(handle))
+                data = self.merge_defaults(json.load(handle))
+                self.primary_valid = True
+                return data
         except Exception as exc:
             log_info(u"Cannot read bounty data: {0}".format(exc))
-            return self.merge_defaults({})
+        if os.path.exists(self.backup_path):
+            try:
+                with open(self.backup_path, "r") as handle:
+                    data = self.merge_defaults(json.load(handle))
+                    self.primary_valid = False
+                    log_info(u"Loaded bounty data from backup.")
+                    return data
+            except Exception as exc:
+                log_info(u"Cannot read bounty backup: {0}".format(exc))
+        self.primary_valid = False
+        raise RuntimeError("bounty.json and backup are unreadable")
 
     def save(self, data):
         self.ensure_dir()
         temp_path = self.path + ".tmp"
-        with open(temp_path, "w") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=False, sort_keys=True)
-        if hasattr(os, "replace"):
-            os.replace(temp_path, self.path)
-        else:
-            if os.path.exists(self.path):
+        try:
+            with open(temp_path, "w") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False, sort_keys=True)
+                handle.flush()
                 try:
-                    os.remove(self.path)
+                    os.fsync(handle.fileno())
                 except Exception:
                     pass
-            os.rename(temp_path, self.path)
+            if os.path.exists(self.path) and self.primary_valid:
+                shutil.copy2(self.path, self.backup_path)
+            if hasattr(os, "replace"):
+                os.replace(temp_path, self.path)
+            else:
+                if os.path.exists(self.path):
+                    os.remove(self.path)
+                os.rename(temp_path, self.path)
+            self.primary_valid = True
+            return True
+        except Exception as exc:
+            log_info(u"Cannot save bounty data: {0}".format(exc))
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return False
 
     def ensure_dir(self):
         folder = os.path.dirname(self.path)
@@ -331,9 +375,18 @@ class EconomyGateway(object):
         return bool(self.manager.withdraw(uuid_str, amount))
 
     def deposit(self, uuid_str, amount, name):
+        success, balance = self.deposit_checked(uuid_str, amount, name)
+        return balance if success else 0.0
+
+    def deposit_checked(self, uuid_str, amount, name):
         if not self.is_ready():
-            return 0.0
-        return self.manager.deposit(uuid_str, amount, name)
+            return False, 0.0
+        if hasattr(self.manager, "deposit_checked"):
+            return self.manager.deposit_checked(uuid_str, amount, name)
+        try:
+            return True, self.manager.deposit(uuid_str, amount, name)
+        except Exception:
+            return False, 0.0
 
     def get_online_names(self):
         names = []
@@ -357,12 +410,23 @@ class BountyState(object):
     def __init__(self, storage):
         self.storage = storage
         self.data = self.storage.load()
+        self.normalize()
+
+    def normalize(self):
+        for key, default in BountyConfig.DEFAULT_STATE.items():
+            self.data.setdefault(key, dict(default) if isinstance(default, dict) else list(default) if isinstance(default, list) else default)
+        now = int(time.time())
+        for record in self.data.get("bounties", {}).values():
+            record.setdefault("created_at", int(record.get("updated_at", now)))
+            record.setdefault("expires_at", now + BountyConfig.BOUNTY_EXPIRE_SECONDS)
+            record.setdefault("contributions", [])
 
     def reload(self):
         self.data = self.storage.load()
+        self.normalize()
 
     def save(self):
-        self.storage.save(self.data)
+        return bool(self.storage.save(self.data))
 
     def get_record(self, uuid_str):
         return self.data.get("bounties", {}).get(str(uuid_str))
@@ -376,7 +440,7 @@ class BountyState(object):
         except Exception:
             return 0.0
 
-    def add_amount(self, uuid_str, name, amount, source):
+    def add_amount(self, uuid_str, name, amount, source, contributor_uuid=None, contributor_name=None):
         uuid_key = str(uuid_str)
         bounties = self.data.setdefault("bounties", {})
         record = bounties.get(uuid_key, {})
@@ -384,9 +448,19 @@ class BountyState(object):
         record["name"] = to_unicode(name)
         record["amount"] = round(float(record.get("amount", 0.0)) + float(amount), 2)
         record["updated_at"] = int(time.time())
+        record.setdefault("created_at", int(time.time()))
+        record["expires_at"] = int(time.time()) + BountyConfig.BOUNTY_EXPIRE_SECONDS
         record[source] = round(float(record.get(source, 0.0)) + float(amount), 2)
+        if contributor_uuid and source == "player_funded":
+            record.setdefault("contributions", []).append({
+                "uuid": str(contributor_uuid),
+                "name": to_unicode(contributor_name or u"Unknown"),
+                "amount": round(float(amount), 2),
+                "created_at": int(time.time())
+            })
         bounties[uuid_key] = record
-        self.save()
+        if not self.save():
+            raise RuntimeError("cannot save bounty state")
         return record["amount"]
 
     def set_amount(self, uuid_str, name, amount):
@@ -402,12 +476,74 @@ class BountyState(object):
             record["amount"] = round(float(amount), 2)
             record["updated_at"] = int(time.time())
             bounties[uuid_key] = record
-        self.save()
+        return self.save()
 
     def claim(self, uuid_str):
-        amount = self.get_amount(uuid_str)
-        self.set_amount(uuid_str, u"Unknown", 0.0)
-        return amount
+        uuid_key = str(uuid_str)
+        record = self.data.setdefault("bounties", {}).pop(uuid_key, None)
+        if not record:
+            return None
+        claim_id = u"claim_{0}_{1}".format(int(time.time() * 1000), uuid_key[:8])
+        pending = {
+            "id": claim_id,
+            "victim_uuid": uuid_key,
+            "record": record,
+            "amount": round(float(record.get("amount", 0.0)), 2),
+            "status": "prepared",
+            "created_at": int(time.time())
+        }
+        self.data.setdefault("pending_payouts", {})[claim_id] = pending
+        if not self.save():
+            self.data["pending_payouts"].pop(claim_id, None)
+            self.data["bounties"][uuid_key] = record
+            return None
+        return pending
+
+    def rollback_claim(self, claim_id):
+        pending = self.data.setdefault("pending_payouts", {}).pop(str(claim_id), None)
+        if not pending:
+            return False
+        self.data.setdefault("bounties", {})[pending["victim_uuid"]] = pending["record"]
+        return self.save()
+
+    def mark_claim_crediting(self, claim_id, killer_uuid, killer_name):
+        pending = self.data.setdefault("pending_payouts", {}).get(str(claim_id))
+        if not pending:
+            return False
+        pending["status"] = "crediting"
+        pending["killer_uuid"] = str(killer_uuid)
+        pending["killer_name"] = to_unicode(killer_name)
+        return self.save()
+
+    def finish_claim(self, claim_id):
+        pending = self.data.setdefault("pending_payouts", {}).pop(str(claim_id), None)
+        if not pending:
+            return False
+        pending["status"] = "paid"
+        pending["finished_at"] = int(time.time())
+        pending.pop("record", None)
+        history = self.data.setdefault("history", [])
+        history.append(pending)
+        if len(history) > BountyConfig.HISTORY_LIMIT:
+            del history[:-BountyConfig.HISTORY_LIMIT]
+        return self.save()
+
+    def queue_notification(self, uuid_str, message):
+        notes = self.data.setdefault("notifications", {}).setdefault(str(uuid_str), [])
+        notes.append(to_unicode(message))
+        if len(notes) > BountyConfig.NOTIFICATION_LIMIT:
+            del notes[:-BountyConfig.NOTIFICATION_LIMIT]
+        return self.save()
+
+    def pop_notifications(self, uuid_str):
+        key = str(uuid_str)
+        notes = list(self.data.setdefault("notifications", {}).get(key, []))
+        if notes:
+            self.data["notifications"].pop(key, None)
+            if not self.save():
+                self.data["notifications"][key] = notes
+                return []
+        return notes
 
     def get_streak(self, uuid_str):
         try:
@@ -477,13 +613,32 @@ class BountyService(object):
             send_message(sender, BountyConfig.PREFIX + u"&cНедостаточно денег для награды.")
             return
 
-        total = self.state.add_amount(target.uuid, target.name, amount, "player_funded")
+        try:
+            total = self.state.add_amount(
+                target.uuid, target.name, amount, "player_funded",
+                contributor_uuid=sender_uuid, contributor_name=sender_name
+            )
+        except Exception as exc:
+            refunded, balance = self.economy.deposit_checked(sender_uuid, amount, sender_name)
+            log_info(u"Bounty placement rollback for {0}: {1}".format(sender_name, exc))
+            if refunded:
+                send_message(sender, BountyConfig.PREFIX + u"&cНаграда не сохранена; деньги возвращены.")
+            else:
+                send_message(sender, BountyConfig.PREFIX + u"&4Критическая ошибка: награда не сохранена и возврат не прошёл. Обратитесь к администратору.")
+            return
         send_message(sender, BountyConfig.PREFIX + u"&aНаграда за &e{0}&a увеличена на &e{1}&a. Всего: &6{2}&a.".format(
             target.name, format_currency(amount), format_currency(total)
         ))
         self.broadcast(u"&e{0} &7назначил награду &6{1} &7за &c{2}&7. Общая награда: &6{3}&7.".format(
             sender_name, format_currency(amount), target.name, format_currency(total)
         ))
+        target_player = Bukkit.getPlayer(to_java_string(target.name)) if BUKKIT_AVAILABLE else None
+        notice = BountyConfig.PREFIX + u"&cЗа вашу голову назначена награда &6{0}&c. Всего: &6{1}&c.".format(
+            format_currency(amount), format_currency(total))
+        if target_player is not None and target_player.isOnline():
+            send_message(target_player, notice)
+        else:
+            self.state.queue_notification(target.uuid, notice)
 
     def handle_death(self, event):
         if not self.is_player_death_event(event):
@@ -501,6 +656,11 @@ class BountyService(object):
         victim_uuid = get_player_uuid(victim)
         killer_uuid = get_player_uuid(killer)
         if not victim_uuid or not killer_uuid or victim_uuid == killer_uuid:
+            return
+
+        if self.state.is_recent_pair(killer_uuid, victim_uuid):
+            send_message(killer, BountyConfig.PREFIX + u"&7Повторное убийство этой жертвы не выдаёт награду и не увеличивает серию.")
+            self.reset_victim_streak(victim)
             return
 
         self.pay_victim_bounty(killer, victim)
@@ -530,10 +690,23 @@ class BountyService(object):
         if amount <= 0:
             return
 
-        self.state.claim(victim_uuid)
         killer_uuid = get_player_uuid(killer)
         killer_name = get_player_name(killer)
-        self.economy.deposit(killer_uuid, amount, killer_name)
+        pending = self.state.claim(victim_uuid)
+        if not pending:
+            send_message(killer, BountyConfig.PREFIX + u"&cНаграду не удалось зарезервировать. Выплата отменена без потери баунти.")
+            return
+        claim_id = pending.get("id")
+        if not self.state.mark_claim_crediting(claim_id, killer_uuid, killer_name):
+            self.state.rollback_claim(claim_id)
+            send_message(killer, BountyConfig.PREFIX + u"&cНаграду не удалось подготовить к выплате.")
+            return
+        deposited, balance = self.economy.deposit_checked(killer_uuid, amount, killer_name)
+        if not deposited:
+            self.state.rollback_claim(claim_id)
+            send_message(killer, BountyConfig.PREFIX + u"&cЭкономика недоступна; награда возвращена на голову жертвы.")
+            return
+        self.state.finish_claim(claim_id)
         self.broadcast(u"&6{0} &7получил награду &e{1} &7за убийство &c{2}&7.".format(
             killer_name, format_currency(amount), get_player_name(victim)
         ))
@@ -558,9 +731,88 @@ class BountyService(object):
             get_player_name(killer), streak, format_currency(auto_amount), format_currency(total)
         ))
 
+    def wanted_level(self, amount):
+        amount = float(amount)
+        if amount >= 50000:
+            return u"§4★★★★★ Легендарная цель"
+        if amount >= 20000:
+            return u"§c★★★★ Опаснейший"
+        if amount >= 7500:
+            return u"§6★★★ Разыскивается"
+        if amount >= 2500:
+            return u"§e★★ Опасный"
+        if amount > 0:
+            return u"§f★ Подозреваемый"
+        return u"§7Нет розыска"
+
+    def expire_bounties(self):
+        now = int(time.time())
+        changed = False
+        for victim_uuid, record in list(self.state.data.setdefault("bounties", {}).items()):
+            if int(record.get("expires_at", now + 1)) > now:
+                continue
+            refund_failed = False
+            for index, contribution in enumerate(record.get("contributions", [])):
+                if contribution.get("refunded"):
+                    continue
+                if contribution.get("refund_status") == "crediting":
+                    # The server stopped after durable intent but before the
+                    # result was recorded. Automatic retry could mint money.
+                    refund_failed = True
+                    continue
+                amount = float(contribution.get("amount", 0.0))
+                if amount <= 0:
+                    contribution["refunded"] = True
+                    continue
+                claim_id = u"refund_{0}_{1}_{2}".format(victim_uuid[:8], index, int(time.time() * 1000))
+                contribution["refund_status"] = "crediting"
+                contribution["refund_claim_id"] = claim_id
+                self.state.data.setdefault("pending_payouts", {})[claim_id] = {
+                    "id": claim_id, "kind": "expiry_refund", "victim_uuid": victim_uuid,
+                    "contribution_index": index, "recipient_uuid": contribution.get("uuid"),
+                    "recipient_name": contribution.get("name"), "amount": amount,
+                    "status": "crediting", "created_at": now
+                }
+                if not self.state.save():
+                    self.state.data["pending_payouts"].pop(claim_id, None)
+                    contribution.pop("refund_claim_id", None)
+                    contribution["refund_status"] = "failed"
+                    refund_failed = True
+                    continue
+                ok, balance = self.economy.deposit_checked(
+                    contribution.get("uuid"), amount, contribution.get("name", u"Hunter"))
+                if not ok:
+                    contribution["refund_status"] = "failed"
+                    contribution.pop("refund_claim_id", None)
+                    self.state.data["pending_payouts"].pop(claim_id, None)
+                    refund_failed = True
+                    self.state.save()
+                    continue
+                contribution["refunded"] = True
+                contribution["refund_status"] = "paid"
+                contribution.pop("refund_claim_id", None)
+                self.state.data["pending_payouts"].pop(claim_id, None)
+                self.state.queue_notification(
+                    contribution.get("uuid"),
+                    BountyConfig.PREFIX + u"&7Награда за &e{0}&7 истекла; вам возвращено &6{1}&7.".format(
+                        record.get("name", u"игрока"), format_currency(amount)))
+            if refund_failed:
+                record["expires_at"] = now + 3600
+                changed = True
+                continue
+            self.state.data["bounties"].pop(victim_uuid, None)
+            changed = True
+        if changed:
+            self.state.save()
+
+    def deliver_notifications(self, player):
+        for note in self.state.pop_notifications(get_player_uuid(player)):
+            send_message(player, note)
+
     def apply_survival_bounties(self):
         if not BUKKIT_AVAILABLE:
             return
+        self.expire_bounties()
         for player in Bukkit.getOnlinePlayers():
             uuid_str = get_player_uuid(player)
             if not uuid_str:
@@ -643,7 +895,10 @@ class BountyCommand(object):
                 page = max(1, int(args[0]))
             except Exception:
                 page = 1
-        self.send_bounty_list(sender, page)
+        if BUKKIT_AVAILABLE and isinstance(sender, Player):
+            self.open_bounty_gui(sender, page)
+        else:
+            self.send_bounty_list(sender, page)
         return True
 
     def execute_admin(self, sender, label, args):
@@ -670,6 +925,10 @@ class BountyCommand(object):
                 self.set_admin_bounty(sender, args[1], amount)
             else:
                 self.add_admin_bounty(sender, args[1], amount)
+        elif sub == "pending":
+            self.send_pending(sender)
+        elif sub == "resolve" and len(args) >= 3:
+            self.resolve_pending(sender, args[1], args[2].lower())
         else:
             self.send_admin_usage(sender, label)
         return True
@@ -684,6 +943,44 @@ class BountyCommand(object):
         send_message(sender, BountyConfig.PREFIX + u"&7Баунти за &e{0}&7: &6{1}&7. Серия убийств: &c{2}&7.".format(
             target.name, format_currency(amount), streak
         ))
+        send_message(sender, u"&7Уровень розыска: {0}".format(self.service.wanted_level(amount)))
+
+    def open_bounty_gui(self, player, page):
+        records = self.state.list_bounties()
+        page_size = 45
+        total_pages = max(1, int((len(records) + page_size - 1) / page_size))
+        page = min(max(1, int(page)), total_pages)
+        inv = Bukkit.createInventory(None, 54, u"§8[БАУНТИ] §0Цели {0}/{1}".format(page, total_pages))
+        start = (page - 1) * page_size
+        for slot, record in enumerate(records[start:start + page_size]):
+            item = ItemStack(Material.PLAYER_HEAD, 1)
+            meta = item.getItemMeta()
+            name = to_unicode(record.get("name", u"Unknown"))
+            try:
+                meta.setOwningPlayer(Bukkit.getOfflinePlayer(to_java_string(name)))
+            except Exception:
+                pass
+            meta.setDisplayName(to_java_string(colorize(u"&c&l" + name)))
+            expires = max(0, int(record.get("expires_at", int(time.time()))) - int(time.time()))
+            lore = [
+                colorize(u"&7Награда: &6" + format_currency(record.get("amount", 0.0))),
+                self.service.wanted_level(record.get("amount", 0.0)),
+                colorize(u"&7Истекает через: &e{0} ч.".format(int(expires / 3600))),
+                colorize(u"&eНажмите для подробностей")
+            ]
+            meta.setLore(build_java_list(lore))
+            item.setItemMeta(meta)
+            inv.setItem(slot, item)
+        if page > 1:
+            prev = ItemStack(Material.ARROW, 1)
+            pm = prev.getItemMeta(); pm.setDisplayName(u"§aПредыдущая страница"); prev.setItemMeta(pm)
+            inv.setItem(45, prev)
+        if page < total_pages:
+            nxt = ItemStack(Material.ARROW, 1)
+            nm = nxt.getItemMeta(); nm.setDisplayName(u"§aСледующая страница"); nxt.setItemMeta(nm)
+            inv.setItem(53, nxt)
+        player.openInventory(inv)
+        open_bounty_guis[get_player_uuid(player)] = {"page": page, "records": records[start:start + page_size]}
 
     def send_bounty_list(self, sender, page):
         records = self.state.list_bounties()
@@ -733,6 +1030,64 @@ class BountyCommand(object):
         send_message(sender, u"&7/{0} clear <игрок>".format(label))
         send_message(sender, u"&7/{0} set <игрок> <сумма>".format(label))
         send_message(sender, u"&7/{0} add <игрок> <сумма>".format(label))
+        send_message(sender, u"&7/{0} pending &8- спорные выплаты после сбоя".format(label))
+        send_message(sender, u"&7/{0} resolve <id> <paid|restore|retry>".format(label))
+
+    def send_pending(self, sender):
+        pending = self.state.data.get("pending_payouts", {})
+        if not pending:
+            send_message(sender, BountyConfig.PREFIX + u"&7Спорных выплат нет.")
+            return
+        for claim_id, item in list(pending.items())[:20]:
+            send_message(sender, u"&8- &e{0} &7{1}: &6{2} &8({3})".format(
+                claim_id, item.get("killer_name", u"?"), format_currency(item.get("amount", 0.0)), item.get("status", "?")))
+
+    def resolve_pending(self, sender, claim_id, action):
+        pending = self.state.data.get("pending_payouts", {}).get(str(claim_id))
+        if not pending:
+            send_message(sender, BountyConfig.PREFIX + u"&cВыплата не найдена.")
+            return
+        if pending.get("kind") == "expiry_refund":
+            victim_record = self.state.data.get("bounties", {}).get(str(pending.get("victim_uuid")))
+            contribution = None
+            if victim_record:
+                for item in victim_record.get("contributions", []):
+                    if item.get("refund_claim_id") == str(claim_id):
+                        contribution = item
+                        break
+            if contribution is None:
+                send_message(sender, BountyConfig.PREFIX + u"&cСвязанная запись взноса не найдена; требуется ручная сверка.")
+                return
+            if action == "retry":
+                ok, balance = self.economy.deposit_checked(
+                    pending.get("recipient_uuid"), pending.get("amount", 0.0), pending.get("recipient_name"))
+                if not ok:
+                    send_message(sender, BountyConfig.PREFIX + u"&cПовторный возврат не подтверждён.")
+                    return
+            elif action != "paid":
+                send_message(sender, BountyConfig.PREFIX + u"&cДля возврата после сверки используйте paid или retry.")
+                return
+            contribution["refunded"] = True
+            contribution["refund_status"] = "paid"
+            contribution.pop("refund_claim_id", None)
+            self.state.data["pending_payouts"].pop(str(claim_id), None)
+            if self.state.save():
+                send_message(sender, BountyConfig.PREFIX + u"&aВозврат взноса закрыт после сверки.")
+            else:
+                send_message(sender, BountyConfig.PREFIX + u"&cРезультат сверки не удалось сохранить; не повторяйте выплату.")
+            return
+        if action == "restore":
+            if self.state.rollback_claim(claim_id):
+                send_message(sender, BountyConfig.PREFIX + u"&aБаунти восстановлено на цели.")
+            else:
+                send_message(sender, BountyConfig.PREFIX + u"&cНе удалось восстановить запись.")
+        elif action == "paid":
+            if self.state.finish_claim(claim_id):
+                send_message(sender, BountyConfig.PREFIX + u"&aВыплата отмечена как уже зачисленная.")
+            else:
+                send_message(sender, BountyConfig.PREFIX + u"&cНе удалось закрыть выплату.")
+        else:
+            send_message(sender, BountyConfig.PREFIX + u"&cИспользуйте paid или restore после проверки economy.json/лога.")
 
     def tab_player_names(self, args):
         prefix = args[-1].lower() if args else ""
@@ -753,11 +1108,13 @@ class BountyCommand(object):
         args = list(args)
         if len(args) == 1:
             prefix = args[0].lower()
-            return build_java_list([item for item in ["reload", "clear", "set", "add"] if item.startswith(prefix)])
+            return build_java_list([item for item in ["reload", "clear", "set", "add", "pending", "resolve"] if item.startswith(prefix)])
         if len(args) == 2 and args[0].lower() in ("clear", "set", "add"):
             return self.tab_player_names(args)
         if len(args) == 3 and args[0].lower() in ("set", "add"):
             return build_java_list(["500", "1000", "5000", "10000"])
+        if len(args) == 3 and args[0].lower() == "resolve":
+            return build_java_list(["paid", "restore"])
         return build_java_list([])
 
     def is_admin(self, sender):
@@ -808,11 +1165,53 @@ registered_command_names = []   # (name, aliases) вручную зарегис�
                                  # рефлексию, в обход command_manager) и не может снять их
                                  # сам при /pyspigot unload.
 survival_task_id = -1
+open_bounty_guis = {}
 state = None
 economy = None
 service = None
 command_handler = None
 initialized = False
+
+
+def on_bounty_inventory_click(event):
+    try:
+        player = event.getWhoClicked()
+        if not isinstance(player, Player):
+            return
+        player_uuid = get_player_uuid(player)
+        gui = open_bounty_guis.get(player_uuid)
+        if gui is None or u"[БАУНТИ]" not in to_unicode(event.getView().getTitle()):
+            return
+        event.setCancelled(True)
+        slot = event.getRawSlot()
+        if slot == 45 and gui.get("page", 1) > 1:
+            command_handler.open_bounty_gui(player, gui["page"] - 1)
+            return
+        if slot == 53:
+            command_handler.open_bounty_gui(player, gui.get("page", 1) + 1)
+            return
+        records = gui.get("records", [])
+        if 0 <= slot < len(records):
+            record = records[slot]
+            player.closeInventory()
+            command_handler.show_player_bounty(player, record.get("name", u"Unknown"))
+    except Exception as exc:
+        log_info(u"Bounty GUI click error: {0}".format(exc))
+
+
+def on_bounty_inventory_close(event):
+    try:
+        open_bounty_guis.pop(get_player_uuid(event.getPlayer()), None)
+    except Exception:
+        pass
+
+
+def on_bounty_player_join(event):
+    try:
+        if service is not None:
+            service.deliver_notifications(event.getPlayer())
+    except Exception as exc:
+        log_info(u"Bounty notification error: {0}".format(exc))
 
 
 def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases):
@@ -1037,6 +1436,9 @@ def on_enable():
     command_handler = BountyCommand(service, state, economy)
     unregister_events()
     register_event(PlayerDeathEvent, service.handle_death)
+    register_event(InventoryClickEvent, on_bounty_inventory_click)
+    register_event(InventoryCloseEvent, on_bounty_inventory_close)
+    register_event(PlayerJoinEvent, on_bounty_player_join)
     register_commands()
     start_survival_timer()
     initialized = True
@@ -1048,6 +1450,7 @@ def on_disable():
     unregister_events()
     unregister_commands()
     stop_survival_timer()
+    open_bounty_guis.clear()
     if state is not None:
         state.save()
     initialized = False

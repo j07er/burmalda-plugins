@@ -16,7 +16,7 @@ cmd_mgr      = ps.command_manager()
 listener_mgr = ps.listener_manager()
 scheduler    = ps.scheduler
 
-from java.lang import System, Byte as JByte, IllegalArgumentException
+from java.lang import System, Byte as JByte, Float as JFloat, IllegalArgumentException
 from java.util import UUID as JUUID, ArrayList, HashMap
 
 from org.bukkit import (
@@ -237,6 +237,14 @@ def add_effect(e, pt, ticks, amp, ambient=False, particles=True):
     if pt is None: return
     e.addPotionEffect(PotionEffect(pt, ticks, amp, ambient, particles, True))
 
+def spawn_dragon_breath(world, location, count,
+                        offset_x=0.0, offset_y=0.0, offset_z=0.0,
+                        extra=0.0, power=1.0):
+    """Paper 1.21.11 требует java.lang.Float как data для DRAGON_BREATH."""
+    world.spawnParticle(Particle.DRAGON_BREATH, location, int(count),
+                        float(offset_x), float(offset_y), float(offset_z),
+                        float(extra), JFloat(float(power)))
+
 def java_list(it):
     lst = ArrayList()
     for x in it: lst.add(x)
@@ -356,8 +364,8 @@ def create_eye(tier, owner_uuid):
         if ENC_MENDING:     m.addEnchant(ENC_MENDING, 1, True)
         if ENC_THORNS:      m.addEnchant(ENC_THORNS, 2, True)
 
-    # По ТЗ прочность у шлема — реальная (для триггеров апгрейда),
-    # поэтому НЕ ставим setUnbreakable(True).
+    # Око всех тиров не расходует прочность.
+    m.setUnbreakable(True)
     it.setItemMeta(m)
     return it
 
@@ -529,7 +537,8 @@ def ability_breath(player):
         # Расставляем частицы вдоль конуса 2×2 перед игроком.
         for step in range(1, BREATH_LENGTH + 1):
             center = eye.clone().add(dv.clone().multiply(step))
-            world.spawnParticle(Particle.DRAGON_BREATH, center, 20, BREATH_RADIUS, BREATH_RADIUS, BREATH_RADIUS, 0.01)
+            spawn_dragon_breath(world, center, 20,
+                                BREATH_RADIUS, BREATH_RADIUS, BREATH_RADIUS, 0.01)
 
         # Урон раз в 20 тиков.
         if state["tick"] % 20 == 0:
@@ -592,7 +601,7 @@ def ability_flight(player):
     active_flight_broken[u] = set()
 
     world = player.getWorld()
-    world.spawnParticle(Particle.DRAGON_BREATH, player.getLocation().add(0, 1, 0),
+    spawn_dragon_breath(world, player.getLocation().add(0, 1, 0),
                         40, 0.5, 0.5, 0.5, 0.03)
     world.playSound(player.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 1.0, 1.0)
     player.sendMessage(u"§5§l✦ Полёт дракона §r§7— 15 секунд.")
@@ -867,7 +876,7 @@ def on_proj_hit(event):
     # Отменяем ванильное создание AreaEffectCloud фаербола (у него слишком слабый эффект).
     # Ставим свой циклический "дыхательный" AoE.
     _start_breath_cloud(world, loc, owner, FIREBALL_CLOUD_R, FIREBALL_CLOUD_DUR)
-    world.spawnParticle(Particle.DRAGON_BREATH, loc, 60, 1.5, 0.5, 1.5, 0.02)
+    spawn_dragon_breath(world, loc, 60, 1.5, 0.5, 1.5, 0.02)
     world.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 0.8, 1.3)
 
 
@@ -878,7 +887,7 @@ def _start_breath_cloud(world, center, owner, radius, duration_ticks):
         if state["tick"] >= duration_ticks:
             return
         # Визуал.
-        world.spawnParticle(Particle.DRAGON_BREATH, center, 30, radius, 0.3, radius, 0.01)
+        spawn_dragon_breath(world, center, 30, radius, 0.3, radius, 0.01)
         # Урон раз в 20 тиков.
         if state["tick"] % 20 == 0:
             for e in world.getNearbyEntities(center, radius, 2.0, radius):
@@ -932,6 +941,18 @@ def _passives_tick():
     try:
         for pl in Bukkit.getOnlinePlayers():
             if not is_dragon(pl): continue
+            # Make already issued Eyes from earlier versions unbreakable too.
+            # New Eyes receive this flag in create_eye().
+            for eye in [pl.getInventory().getHelmet()] + list(pl.getInventory().getContents()):
+                if not is_eye(eye):
+                    continue
+                try:
+                    meta = eye.getItemMeta()
+                    if meta is not None and not meta.isUnbreakable():
+                        meta.setUnbreakable(True)
+                        eye.setItemMeta(meta)
+                except Exception:
+                    pass
             u = uid(pl)
 
             # Урон в воде каждые 2 сек.
@@ -1309,16 +1330,7 @@ _reset_reg.put("dragon", _dragon_reset_state)
 
 # --- Публикация в каталог Зеркала Души Арчера ---
 def _dragon_mirror_eye(owner_uuid):
-    it = ItemStack(Material.LEATHER_HELMET, 1)
-    m = it.getItemMeta()
-    m.setDisplayName(u"§5Око Дракона")
-    if isinstance(m, LeatherArmorMeta):
-        try: m.setColor(Color.fromRGB(20, 20, 20))
-        except Exception: pass
-    if ENC_PROT:        m.addEnchant(ENC_PROT, 1, True)
-    if ENC_RESPIRATION: m.addEnchant(ENC_RESPIRATION, 1, True)
-    it.setItemMeta(m)
-    return it
+    return create_eye(2, owner_uuid)
 
 _MIRROR_CATALOG_KEY = "archer.mirror_catalog"
 _mirror_cat = _props.get(_MIRROR_CATALOG_KEY)

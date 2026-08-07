@@ -70,7 +70,7 @@ TIER_NAME = {
 
 # CDs (ticks)
 CD_JUMP    = 18 * 20
-CD_TONGUE  = 60 * 20
+CD_TONGUE  = 20 * 20
 CD_ULT     = int(4.5 * 60) * 20
 
 # Способности

@@ -22,7 +22,7 @@ except Exception:
 
 from org.bukkit import Bukkit, ChatColor
 from org.bukkit.entity import Player
-from org.bukkit.event.player import PlayerAdvancementDoneEvent, PlayerPortalEvent
+from org.bukkit.event.player import PlayerAdvancementDoneEvent
 from org.bukkit.event import EventPriority, Listener
 from org.bukkit.plugin import EventExecutor
 from org.bukkit.event import HandlerList
@@ -35,7 +35,7 @@ from java.lang import String as JavaString, StringBuilder
 
 class PluginConfig(object):
     PLUGIN_NAME = u"SmartY-WorldAchievements"
-    VERSION = u"1.1.0"
+    VERSION = u"1.2.0"
     PREFIX = u"&2&l[Граница]&r "
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
@@ -301,44 +301,6 @@ class AdvancementService(object):
         send_message(player, PluginConfig.PREFIX + u"&aМир расширился! &7Новый радиус: &e{0:.0f}".format(new_size))
         log_info(u"Advancement: {0} → border = {1:.0f}".format(key, new_size))
 
-class PortalAccessService(object):
-    def __init__(self, state):
-        self.state = state
-
-    def handle_portal(self, event):
-        env = self._get_environment(event)
-        if env == "NETHER" and not self.state.is_nether_enabled():
-            self._cancel(event, u"&cАд пока закрыт администрацией.")
-        elif env == "THE_END" and not self.state.is_end_enabled():
-            self._cancel(event, u"&cЭнд пока закрыт администрацией.")
-
-    def _get_environment(self, event):
-        try:
-            to = event.getTo()
-            if to is not None and to.getWorld() is not None:
-                return str(to.getWorld().getEnvironment().name())
-        except Exception:
-            pass
-        try:
-            cause = str(event.getCause().name())
-            if cause == "NETHER_PORTAL":
-                return "NETHER"
-            if cause == "END_PORTAL":
-                return "THE_END"
-        except Exception:
-            pass
-        return ""
-
-    def _cancel(self, event, message):
-        try:
-            event.setCancelled(True)
-        except Exception:
-            pass
-        try:
-            send_message(event.getPlayer(), PluginConfig.PREFIX + message)
-        except Exception:
-            pass
-
 # ============================================================================
 #  COMMAND HANDLER
 # ============================================================================
@@ -468,7 +430,6 @@ registered_listeners = []
 state = None
 border_service = None
 advancement_service = None
-portal_service = None
 command_handler = None
 initialized = False
 
@@ -561,12 +522,13 @@ def force_unregister_command():
         log_info(u"Command unregistration error: " + unicode(e))
 
 def on_enable():
-    global state, border_service, advancement_service, portal_service, command_handler, initialized
+    global state, border_service, advancement_service, command_handler, initialized
 
     if initialized:
         return
 
-    log_info(u"Starting SmartY-WorldAchievements v1.1.0 (прогрессивное расширение ×1.5)")
+    log_info(u"Starting SmartY-WorldAchievements v{0} (прогрессивное расширение ×1.5)".format(
+        PluginConfig.VERSION))
 
     storage = JsonStorage(PluginConfig.DATA_FILE, PluginConfig.DEFAULT_STATE)
     state = AdvancementState(storage)
@@ -574,12 +536,10 @@ def on_enable():
 
     border_service = WorldBorderService(state)
     advancement_service = AdvancementService(state, border_service)
-    portal_service = PortalAccessService(state)
     command_handler = WorldAchievementsCommand(state, border_service)
 
     unregister_events()
     register_event(PlayerAdvancementDoneEvent, advancement_service.handle_done)
-    register_event(PlayerPortalEvent, portal_service.handle_portal)
 
     force_register_command()
     border_service.apply()

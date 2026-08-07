@@ -10,7 +10,7 @@
   применение способности через "трату" заряда. Механически — глобальный CD 3с.
 
   Магия Небесного Дракона (заклинания в сторону цели впереди):
-    - /wendy троя     — Регенерация I на цель (15с)
+    - /wendy троя     — Регенерация II на цель (15с)
     - /wendy вернир   — Скорость I           (15с)
     - /wendy армс     — Сила I               (15с)
     - /wendy армор    — Сопротивление I      (15с)
@@ -18,7 +18,7 @@
   (у всей магии общий КД 30 сек)
 
   Ре-райс:
-    - Пассив: иммунитет к урону от удушья (SUFFOCATION + DROWNING).
+    - Пассив: иммунитет к урону от удушья (SUFFOCATION).
     - При активации на 5 сек: Glowing всем в r=15, Прыгучесть II, купол
       отражения снарядов, свист.
     - CD 15 сек.
@@ -36,7 +36,7 @@
     - -1 сердце max HP (18 HP).
     - Мясо восстанавливает только 0.5 голода (через FoodLevelChangeEvent).
     - +30% урона от POISON эффекта.
-    - Sonic Boom в ульте подбрасывает цель на ~10 блоков.
+    - Любая атака в ульте подбрасывает цель примерно на 15 блоков.
 ==============================================================================
 """
 
@@ -58,6 +58,7 @@ from org.bukkit.event.player import (
     PlayerInteractEvent, PlayerItemHeldEvent, PlayerJoinEvent,
     PlayerRespawnEvent, PlayerDropItemEvent, PlayerItemConsumeEvent
 )
+from org.bukkit.event.block import Action
 from org.bukkit.event.entity import (
     EntityDamageEvent, EntityDamageByEntityEvent,
     EntityPotionEffectEvent, FoodLevelChangeEvent, ProjectileHitEvent,
@@ -105,6 +106,7 @@ FREE_CD_PLAYERS = set([u"blueredtronce"])
 # PDC keys
 KEY_WIND_CHARGE = NamespacedKey.fromString("wendy:wind_charge")
 KEY_OWNER       = NamespacedKey.fromString("wendy:owner")
+KEY_REFLECT_TICK= NamespacedKey.fromString("wendy:reflect_tick")
 
 # Cooldowns (ticks)
 CD_WIND_CHARGE = 3 * 20         # 3 сек — общий "перезарядка заряда"
@@ -129,14 +131,16 @@ ULT_BUFF_DURATION       = 15 * 20
 ULT_POST_DEBUFF         = 15 * 20
 ULT_SONIC_MAX_CHARGES   = 4
 ULT_SONIC_DAMAGE        = 4.0      # 4 HP чистого (как у Вардена)
-ULT_LAUNCH_Y            = 2.4      # ~10 блоков подброс
+ULT_LAUNCH_Y            = 1.8      # примерно 15 блоков подъёма
 
 # Слабости
 MAX_HP_REDUCTION = -2.0            # -1 сердце
 POISON_DMG_MULT  = 1.30            # +30% урона
-MEAT_FOOD_MULT   = 0.25            # мясо восстанавливает 1/4 (округление до 0.5)
+# Мясо восстанавливает ровно половину деления голода (1 food point).
+MEAT_FOOD_GAIN   = 1
+SWEET_FOOD_GAIN  = 8               # как жареная говядина
 
-# Мясо (только приготовленное считается едой):
+# Любое мясо и рыба усваиваются плохо, независимо от приготовления.
 MEAT_MATERIALS = set([
     Material.BEEF, Material.COOKED_BEEF,
     Material.PORKCHOP, Material.COOKED_PORKCHOP,
@@ -147,6 +151,14 @@ MEAT_MATERIALS = set([
     Material.SALMON, Material.COOKED_SALMON,
     Material.TROPICAL_FISH, Material.PUFFERFISH,
     Material.ROTTEN_FLESH,
+])
+
+SWEET_MATERIALS = set([
+    Material.COOKIE, Material.APPLE, Material.GOLDEN_APPLE,
+    Material.ENCHANTED_GOLDEN_APPLE, Material.MELON_SLICE,
+    Material.SWEET_BERRIES, Material.GLOW_BERRIES,
+    Material.CHORUS_FRUIT, Material.PUMPKIN_PIE,
+    Material.HONEY_BOTTLE,
 ])
 
 # Attribute mod UUIDs
@@ -274,10 +286,13 @@ def set_cd(player, name, ticks):
         cooldowns[u] = {}
     cooldowns[u][name] = now_tick() + ticks
 
-def _touch_wind_charge(player):
+def _touch_wind_charge(player, visual_cd=True):
     """Общий 3-сек КД любого использования Заряда ветра."""
     if not check_cd(player, "wind_charge", u"«Заряд ветра»"): return False
     set_cd(player, "wind_charge", CD_WIND_CHARGE)
+    if visual_cd and not _is_free_cd(player):
+        try: player.setCooldown(Material.WIND_CHARGE, CD_WIND_CHARGE)
+        except Exception: pass
     return True
 
 
@@ -312,7 +327,7 @@ def create_wind_charge(owner_uuid):
         u"§8Бесконечный, но с §fКД 3 сек §8между применениями.",
         u"",
         u"§8Магия Небесного Дракона:",
-        u"§8  §f/wendy троя §7— Регенерация I цели",
+        u"§8  §f/wendy троя §7— Регенерация II цели",
         u"§8  §f/wendy вернир §7— Скорость I",
         u"§8  §f/wendy армс §7— Сила I",
         u"§8  §f/wendy армор §7— Сопротивление I",
@@ -459,7 +474,7 @@ def _cast_buff_on_target(player, spell_name, ptype, amp, effect_display):
 
 
 def ability_troia(player):
-    _cast_buff_on_target(player, u"Троя",    E_REGEN,      0, u"Регенерация I 15с")
+    _cast_buff_on_target(player, u"Троя",    E_REGEN,      1, u"Регенерация II 15с")
 
 def ability_vernier(player):
     _cast_buff_on_target(player, u"Вернир",  E_SPEED,      0, u"Скорость I 15с")
@@ -554,6 +569,12 @@ def ability_reraise(player):
             return
         try:
             loc = player.getLocation()
+            # Подсвечиваем не только стартовые цели, но и всех, кто войдёт
+            # в область в течение пяти секунд действия Ре-райса.
+            for entity in world.getNearbyEntities(loc, RERAISE_RADIUS,
+                                                   RERAISE_RADIUS, RERAISE_RADIUS):
+                if isinstance(entity, LivingEntity) and not entity.equals(player):
+                    add_effect(entity, E_GLOWING, 12, 0)
             import math
             r = 2.5
             # Кольцо снизу вверх.
@@ -755,8 +776,7 @@ def on_damage(event):
     cause = event.getCause()
 
     # Пассив: иммунитет к удушью.
-    if cause in (EntityDamageEvent.DamageCause.SUFFOCATION,
-                 EntityDamageEvent.DamageCause.DROWNING):
+    if cause == EntityDamageEvent.DamageCause.SUFFOCATION:
         event.setCancelled(True)
         return
 
@@ -771,14 +791,38 @@ def on_damage(event):
 
 
 def on_damage_by(event):
+    victim = event.getEntity()
     dmg = event.getDamager()
-    if not isinstance(dmg, Player) or not is_wendy(dmg):
+
+    # Купол должен отменять урон до попадания, а не пытаться исправить его
+    # постфактум через ProjectileHitEvent.
+    if isinstance(victim, Player) and is_wendy(victim) and isinstance(dmg, Projectile):
+        end = reraise_active.get(uid(victim), 0)
+        if now_tick() < end:
+            event.setCancelled(True)
+            _reflect_projectile(dmg, victim)
+            return
+
+    attacker = dmg if isinstance(dmg, Player) else None
+    if attacker is None and isinstance(dmg, Projectile):
+        try:
+            shooter = dmg.getShooter()
+            if isinstance(shooter, Player): attacker = shooter
+        except Exception: pass
+    if attacker is None or not is_wendy(attacker) or not _is_ult_active(attacker):
         return
-    # Во время BUFF-фазы ульта каждый удар подбрасывает цель.
-    # Уточнение по ТЗ ("Sonic Boom подбрасывает"): по ответу — только Sonic
-    # подбрасывает. Обычные удары НЕ подбрасывают.
-    # Оставим как задел на будущее, но не активируем.
-    pass
+    if not isinstance(victim, LivingEntity) or victim.equals(attacker):
+        return
+
+    # В течение всех 45 секунд формы каждая прямая или стрелковая атака
+    # Венди подбрасывает цель примерно на 15 блоков.
+    try:
+        velocity = victim.getVelocity()
+        velocity.setY(max(velocity.getY(), ULT_LAUNCH_Y))
+        victim.setVelocity(velocity)
+        victim.getWorld().spawnParticle(Particle.CLOUD,
+            victim.getLocation(), 24, 0.45, 0.2, 0.45, 0.04)
+    except Exception: pass
 
 
 def on_potion_effect(event):
@@ -823,30 +867,23 @@ def on_food_change(event):
     ent = event.getEntity()
     if not isinstance(ent, Player) or not is_wendy(ent):
         return
-    # Флаг ставится в on_consume: если он проглотил мясо, дальше FoodLevelChange
-    # обрезаем прирост.
     try:
-        st = _pending_meat.pop(uid(ent), None)
-        if st is None: return
+        food_kind = _pending_food.pop(uid(ent), None)
+        if food_kind is None: return
         old_lvl = ent.getFoodLevel()
         new_lvl = event.getFoodLevel()
         gain = new_lvl - old_lvl
         if gain <= 0: return
-        # Мясо восстанавливает 25% от нормы, минимум 0 (округление вниз).
-        # По ТЗ: "лишь половину единицы голода". Ставим фиксированно +0-1.
-        # Простая математика: reduced = max(0, int(round(gain * 0.25)))
-        reduced = max(0, int(round(gain * MEAT_FOOD_MULT)))
-        if reduced == 0 and gain > 0:
-            # Гарантируем хотя бы 1 (половину единицы = 0.5 округляется до 0
-            # или 1; пусть будет 1, чтобы Венди не совсем голодала от мяса).
-            reduced = 1
-        event.setFoodLevel(old_lvl + reduced)
+        if food_kind == "meat":
+            event.setFoodLevel(min(20, old_lvl + MEAT_FOOD_GAIN))
+        elif food_kind == "sweet":
+            event.setFoodLevel(min(20, old_lvl + SWEET_FOOD_GAIN))
     except Exception:
         pass
 
 
-# uid -> flag: последний consume был мясом.
-_pending_meat = {}
+# uid -> "meat" | "sweet": тип последней съеденной пищи.
+_pending_food = {}
 
 def on_consume(event):
     p = event.getPlayer()
@@ -854,7 +891,9 @@ def on_consume(event):
     it = event.getItem()
     if it is None: return
     if it.getType() in MEAT_MATERIALS:
-        _pending_meat[uid(p)] = True
+        _pending_food[uid(p)] = "meat"
+    elif it.getType() in SWEET_MATERIALS:
+        _pending_food[uid(p)] = "sweet"
 
 
 def on_projectile_hit(event):
@@ -883,6 +922,11 @@ def on_projectile_hit(event):
 
 def _reflect_projectile(proj, wendy):
     try:
+        pdc = proj.getPersistentDataContainer()
+        last_tick = pdc.get(KEY_REFLECT_TICK, PersistentDataType.LONG)
+        if last_tick is not None and now_tick() - long(last_tick) <= 2:
+            return
+        pdc.set(KEY_REFLECT_TICK, PersistentDataType.LONG, JLong(now_tick()))
         v = proj.getVelocity()
         # Инвертируем + чуть увеличиваем.
         v = v.multiply(-1.1)
@@ -901,6 +945,77 @@ def _reflect_projectile(proj, wendy):
             pass
         wendy.getWorld().spawnParticle(Particle.CLOUD, loc, 15, 0.3, 0.3, 0.3, 0.05)
         wendy.getWorld().playSound(loc, Sound.ITEM_SHIELD_BLOCK, 1.0, 1.6)
+    except Exception:
+        pass
+
+
+def on_interact(event):
+    """Даёт бросить ванильный заряд и восстанавливает особый предмет после использования."""
+    try:
+        p = event.getPlayer()
+        if not is_wendy(p):
+            return
+        action = event.getAction()
+
+        # Торт тоже считается сладкой пищей, хотя съедается кликом по блоку,
+        # а не через PlayerItemConsumeEvent.
+        if action == Action.RIGHT_CLICK_BLOCK:
+            clicked = event.getClickedBlock()
+            if clicked is not None and clicked.getType() == Material.CAKE:
+                _pending_food[uid(p)] = "sweet"
+
+        if action not in (Action.RIGHT_CLICK_AIR, Action.RIGHT_CLICK_BLOCK):
+            return
+        it = event.getItem()
+        if not is_wind_charge(it):
+            return
+
+        # На КД отменяем бросок. При готовом заряде событие НЕ отменяется —
+        # Minecraft создаёт настоящий WIND_CHARGE projectile.
+        # Визуальный Bukkit-cooldown ставим на следующий тик: если поставить
+        # его внутри события, Leaf может отменить ещё не созданный снаряд.
+        if not _touch_wind_charge(p, False):
+            event.setCancelled(True)
+            return
+
+        snapshot = it.clone()
+        snapshot.setAmount(1)
+        hand = event.getHand()
+        held_slot = p.getInventory().getHeldItemSlot()
+
+        def restore_charge():
+            try:
+                if not p.isOnline(): return
+                if not _is_free_cd(p):
+                    try: p.setCooldown(Material.WIND_CHARGE, CD_WIND_CHARGE)
+                    except Exception: pass
+                inv = p.getInventory()
+
+                # В creative или при отмене другим плагином предмет мог не
+                # списаться. В таком случае только нормализуем количество.
+                for existing in inv.getContents():
+                    if is_wind_charge(existing):
+                        existing.setAmount(1)
+                        return
+
+                if hand == EquipmentSlot.OFF_HAND:
+                    current = inv.getItemInOffHand()
+                    if current is None or current.getType() == Material.AIR:
+                        inv.setItemInOffHand(snapshot)
+                        return
+                else:
+                    current = inv.getItem(held_slot)
+                    if current is None or current.getType() == Material.AIR:
+                        inv.setItem(held_slot, snapshot)
+                        return
+
+                leftovers = inv.addItem(snapshot)
+                if not leftovers.isEmpty():
+                    p.sendMessage(u"§cОсвободи место в инвентаре для Заряда ветра.")
+            except Exception as ex:
+                Bukkit.getLogger().warning("[wendy] restore wind charge: " + str(ex))
+
+        scheduler.runTaskLater(restore_charge, 1)
     except Exception:
         pass
 
@@ -957,7 +1072,7 @@ def cmd_wendy(sender, label, args):
 
     if len(args) == 0:
         sender.sendMessage(u"§7/wendy <способность>")
-        sender.sendMessage(u"  §f/wendy троя §7— Регенерация I цели")
+        sender.sendMessage(u"  §f/wendy троя §7— Регенерация II цели")
         sender.sendMessage(u"  §f/wendy вернир §7— Скорость I")
         sender.sendMessage(u"  §f/wendy армс §7— Сила I")
         sender.sendMessage(u"  §f/wendy армор §7— Сопротивление I")
@@ -1005,7 +1120,7 @@ def _reset_state(player):
     cooldowns.pop(u, None)
     ult_active.pop(u, None)
     reraise_active.pop(u, None)
-    _pending_meat.pop(u, None)
+    _pending_food.pop(u, None)
 
 
 # ============================================================================
@@ -1021,6 +1136,7 @@ listener_mgr.registerListener(on_food_change,     FoodLevelChangeEvent)
 listener_mgr.registerListener(on_consume,         PlayerItemConsumeEvent)
 listener_mgr.registerListener(on_projectile_hit,  ProjectileHitEvent)
 listener_mgr.registerListener(on_drop,            PlayerDropItemEvent)
+listener_mgr.registerListener(on_interact,        PlayerInteractEvent)
 listener_mgr.registerListener(on_join,            PlayerJoinEvent)
 listener_mgr.registerListener(on_respawn,         PlayerRespawnEvent)
 

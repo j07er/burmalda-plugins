@@ -96,12 +96,11 @@ TIER_NAME = {
 }
 
 # Королевская воля (переработка 2026-07-28: CC вместо DPS)
-# Радиус 5, урон 1 HP чистого/сек, + Slowness II + Nausea + Darkness.
+# Радиус 5, без урона: сильный Slowness + Nausea + Darkness.
 # Шанкс НЕ получает эффекты в своей ауре.
 WILL_RADIUS      = 5.0
 WILL_DURATION    = 5 * 20         # 5 секунд
 WILL_TICK_PERIOD = 20             # раз в секунду
-WILL_TICK_DMG    = 1.0            # 0.5 сердца чистого в секунду
 CD_WILL          = 3 * 60 * 20    # 3 минуты
 
 # Воля Наблюдения (новая): активная, подсвечивает всех игроков в радиусе 30.
@@ -110,9 +109,9 @@ OBSERVE_RADIUS   = 30.0
 CD_OBSERVE       = 60 * 20        # 1 минута
 
 # Воля Вооружения (новая): следующий удар в течение 10 сек добавляет
-# +1.5 HP чистого урона, игнорируя броню и Prot-чары.
+# +1 HP чистого урона, игнорируя броню и Prot-чары.
 ARMAMENT_WINDOW  = 10 * 20
-ARMAMENT_BONUS   = 1.5
+ARMAMENT_BONUS   = 1.0
 CD_ARMAMENT      = 30 * 20        # 30 сек
 
 # Атрибуты
@@ -374,23 +373,11 @@ def kit_entry(player, args_list):
 
 def deal_pure_damage(target, amount, attacker):
     if not isinstance(target, LivingEntity): return
-    if _HAS_DAMAGE_API:
-        try:
-            src = (DamageSource.builder(DamageType.MAGIC)
-                   .withDirectEntity(attacker)
-                   .withCausingEntity(attacker)
-                   .build())
-            _pure_dmg_in_progress.add(uid(attacker))
-            try:
-                target.damage(amount, src)
-            finally:
-                _pure_dmg_in_progress.discard(uid(attacker))
-            return
-        except Exception:
-            pass
+    # setHealth гарантированно не проходит повторно через броню, Protection,
+    # Resistance и другие модификаторы EntityDamageEvent.
     new_hp = target.getHealth() - amount
     if new_hp <= 0.0:
-        try: target.damage(target.getMaxHealth() * 2, attacker)
+        try: target.damage(target.getMaxHealth() * 20, attacker)
         except Exception: target.setHealth(0.0)
     else:
         target.setHealth(new_hp)
@@ -433,7 +420,7 @@ def ability_will(player):
         # 1) Кольцо частиц на уровне ног.
         _draw_will_ring(world, center, r)
 
-        # 2) Раз в секунду — CC-эффекты + чистый урон 1 HP.
+        # 2) Раз в секунду — только контроль, без какого-либо урона.
         if state["tick"] % WILL_TICK_PERIOD == 0:
             for e in world.getNearbyEntities(center, r + 1, r + 2, r + 1):
                 if not isinstance(e, LivingEntity): continue
@@ -444,13 +431,11 @@ def ability_will(player):
                      (e.getLocation().getZ() - center.getZ())**2
                 if d2 > r * r + 4.0:
                     continue
-                # Чистый урон 1 HP/сек (0.5 сердца/сек).
-                deal_pure_damage(e, WILL_TICK_DMG, player)
-                # CC-эффекты: Slowness II + Nausea + Darkness. Обновляются
+                # CC-эффекты: Slowness IV + Nausea + Darkness. Обновляются
                 # каждую секунду, длительность 25 тиков — с запасом.
                 add_effect(e, E_NAUSEA, WILL_TICK_PERIOD + 20, 0)
                 if E_SLOWNESS is not None:
-                    add_effect(e, E_SLOWNESS, WILL_TICK_PERIOD + 20, 1)   # Slowness II
+                    add_effect(e, E_SLOWNESS, WILL_TICK_PERIOD + 20, 3)   # Slowness IV
                 if E_DARKNESS is not None:
                     add_effect(e, E_DARKNESS, WILL_TICK_PERIOD + 20, 0)
 
@@ -557,7 +542,7 @@ def ability_observe(player):
 # =============================================================================
 #
 # Активная. На 10 сек следующий удар Грифоном по игроку добавляет
-# +1.5 HP чистого урона (игнорирует броню, Prot-чары).
+# +1 HP чистого урона (игнорирует броню, Prot-чары).
 # КД 30 сек.
 
 def ability_armament(player):
@@ -722,7 +707,8 @@ def on_damage_by(event):
     if isinstance(dmg, Player) and is_shanks(dmg):
         u = uid(dmg)
         end = armament_active.get(u, 0)
-        if end > 0 and now_tick() < end and isinstance(ent, LivingEntity) and not ent.equals(dmg):
+        held_griffon = is_griffon(dmg.getInventory().getItemInMainHand())
+        if end > 0 and now_tick() < end and held_griffon and isinstance(ent, LivingEntity) and not ent.equals(dmg):
             # Тратим окно — только один удар.
             armament_active.pop(u, None)
             # Наносим бонус чистым уроном через отложенный тик (после ванильного).
@@ -820,7 +806,7 @@ def cmd_shanks(sender, label, args):
         sender.sendMessage(u"§7Использование:")
         sender.sendMessage(u"  §f/shanks воля §7— Королевская Воля (CC-аура, 5 сек)")
         sender.sendMessage(u"  §f/shanks наблюдение §7— Воля Наблюдения (подсветка игроков, 10 сек)")
-        sender.sendMessage(u"  §f/shanks вооружение §7— Воля Вооружения (+1.5 HP чистого)")
+        sender.sendMessage(u"  §f/shanks вооружение §7— Воля Вооружения (+1 HP чистого)")
         sender.sendMessage(u"  §f/shanks тир <1..6>")
         return True
 

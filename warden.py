@@ -74,7 +74,7 @@ except ImportError:
 #  CONSTANTS
 # =============================================================================
 
-WARDEN_NAMES    = set([u"dni214", u"idinahuo", u"blueredtronce"])
+WARDEN_NAMES    = set([u"idinahuo"])
 FREE_CD_PLAYERS = set([u"blueredtronce"])
 
 KEY_PICK  = NamespacedKey.fromString("warden:pick")
@@ -1230,13 +1230,7 @@ _reset_reg.put("warden", _warden_reset_state)
 
 # --- Публикация в каталог Зеркала Души Арчера ---
 def _warden_mirror_pick(owner_uuid):
-    it = ItemStack(Material.STONE_PICKAXE, 1)
-    m = it.getItemMeta()
-    m.setDisplayName(u"§3Сердце Скалка")
-    if ENC_EFFICIENCY is not None:
-        m.addEnchant(ENC_EFFICIENCY, 1, True)
-    it.setItemMeta(m)
-    return it
+    return create_pick(2, owner_uuid)
 
 _MIRROR_CATALOG_KEY = "archer.mirror_catalog"
 _mirror_cat = _props.get(_MIRROR_CATALOG_KEY)

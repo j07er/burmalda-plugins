@@ -16,9 +16,18 @@ SmartY-Economy System — ВЕРСИЯ 3.0.0 (PAYDAY & MOB MONEY DROP SYSTEM)
 import os
 import sys
 import json
+import io
 import time
 import re
 import random
+import threading
+
+try:
+    import pyspigot as _pyspigot
+    PYSPIGOT_MANAGERS_AVAILABLE = True
+except ImportError:
+    _pyspigot = None
+    PYSPIGOT_MANAGERS_AVAILABLE = False
 
 # Совместимость unicode в Python 2 (Jython) и Python 3
 try:
@@ -238,12 +247,16 @@ def safe_amount(amount, default=0.0):
     return val
 
 
+def reject_json_constant(value):
+    raise ValueError("non-finite JSON number: {0}".format(value))
+
+
 # -----------------------------------------------------------------------------
 # ГЛОБАЛЬНЫЕ НАСТРОЙКИ И СООБЩЕНИЯ ЭКОНОМИКИ
 # -----------------------------------------------------------------------------
 class EconomyConfig:
     PLUGIN_NAME = u"SmartY-Economy"
-    VERSION = u"3.4.0"
+    VERSION = u"3.8.0"
     PREFIX = u"&a&l[\u042d\u043a\u043e\u043d\u043e\u043c\u0438\u043a\u0430]&r "
 
     DEFAULT_BALANCE = 100.0
@@ -260,6 +273,7 @@ class EconomyConfig:
     TOWNS_FILE = os.path.join(DATA_DIR, "cities.json")
     COMPANIES_FILE = os.path.join(DATA_DIR, "companies.json")
     TRANSACTIONS_LOG = os.path.join(DATA_DIR, "economy_transactions.log")
+    DB_BACKUP_FILE = DB_FILE + ".bak"
 
     # Порог "неактивности" для payday (сек). Игрок должен был сдвинуться
     # в течение этого окна, иначе прогресс payday замирает. Настраивается
@@ -268,6 +282,8 @@ class EconomyConfig:
 
     # Baltop cache TTL (сек) — топ-10 пересчитывается раз в X сек.
     BALTOP_CACHE_TTL = 300.0
+    HUD_FILE_CACHE_TTL = 5.0
+    PAYDAY_MAX_ELAPSED_SECONDS = 90.0
 
     MESSAGES = {
         "balance_self": u"{prefix}&7Ваш текущий баланс: &a{formatted_balance}",
@@ -431,6 +447,253 @@ MOB_DISPLAY_NAMES = {
 }
 
 
+# Mob rewards are intentionally conservative: direct player kills in normal
+# hunting are paid, while spawner/breeding mobs and grinder-like bursts are not.
+MOB_REWARD_WINDOW_SECONDS = 60.0
+MOB_REWARD_KILL_LIMIT = 10
+MOB_REWARD_MONEY_LIMIT = 50.0
+MOB_REWARD_AREA_LIMIT = 8
+MOB_REWARD_AREA_SIZE = 8.0
+MOB_REWARD_DENSITY_RADIUS = 12.0
+MOB_REWARD_DENSITY_LIMIT = 12
+MOB_BOSS_WINDOW_SECONDS = 3600.0
+MOB_BOSS_LIMIT = 2
+MOB_REWARD_HOURLY_LIMIT = 1000.0
+MOB_REWARD_STATE_FILE = os.path.join(EconomyConfig.DATA_DIR, "mob_reward_limits.json")
+MOB_NO_REWARD_SPAWN_REASONS = set([
+    "SPAWNER", "TRIAL_SPAWNER", "SPAWNER_EGG", "BREEDING", "BUILD_IRONGOLEM",
+    "BUILD_SNOWMAN", "BUILD_WITHER", "DISPENSE_EGG", "OCELOT_BABY",
+    "VILLAGE_DEFENSE", "SHEARED", "SLIME_SPLIT", "SILVERFISH_BLOCK",
+    "REINFORCEMENTS", "DUPLICATION", "CUSTOM", "COMMAND"
+])
+def _load_mob_reward_history():
+    try:
+        if not os.path.exists(MOB_REWARD_STATE_FILE):
+            return {}
+        f = io.open(MOB_REWARD_STATE_FILE, "r", encoding="utf-8")
+        try: data = json.load(f)
+        finally: f.close()
+        if not isinstance(data, dict):
+            return {}
+        now = time.time()
+        result = {}
+        for player_uuid, records in data.items():
+            if not isinstance(records, list): continue
+            kept = []
+            for record in records:
+                if not isinstance(record, dict): continue
+                if now - float(record.get("time", 0.0)) <= MOB_BOSS_WINDOW_SECONDS:
+                    kept.append({"time": float(record.get("time", 0.0)),
+                                 "amount": float(record.get("amount", 0.0)),
+                                 "boss": bool(record.get("boss", False))})
+            if kept: result[str(player_uuid)] = kept
+        return result
+    except Exception as exc:
+        log_error(u"Could not load mob reward limits: {0}".format(exc))
+        return {}
+
+
+def _save_mob_reward_history():
+    temp_file = MOB_REWARD_STATE_FILE + ".tmp"
+    try:
+        if not os.path.exists(EconomyConfig.DATA_DIR):
+            os.makedirs(EconomyConfig.DATA_DIR)
+        payload = json.dumps(mob_reward_history, ensure_ascii=True, indent=2, sort_keys=True)
+        if not isinstance(payload, unicode): payload = payload.decode("utf-8", "replace")
+        f = io.open(temp_file, "w", encoding="utf-8")
+        try:
+            f.write(payload)
+            f.flush()
+            try: os.fsync(f.fileno())
+            except Exception: pass
+        finally:
+            f.close()
+        try:
+            from java.nio.file import Files, Paths, StandardCopyOption
+            Files.move(Paths.get(temp_file), Paths.get(MOB_REWARD_STATE_FILE),
+                       StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        except Exception:
+            if os.path.exists(MOB_REWARD_STATE_FILE): os.remove(MOB_REWARD_STATE_FILE)
+            os.rename(temp_file, MOB_REWARD_STATE_FILE)
+        return True
+    except Exception as exc:
+        log_error(u"Could not save mob reward limits: {0}".format(exc))
+        return False
+
+
+mob_reward_history = _load_mob_reward_history()
+mob_reward_area_history = {}
+mob_reward_warning_until = {}
+
+
+def _mob_spawn_reason(entity):
+    try:
+        reason = entity.getEntitySpawnReason()
+        return str(reason.name()) if reason is not None else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _mob_area_key(location):
+    try:
+        size = MOB_REWARD_AREA_SIZE
+        return (location.getWorld().getUID().toString(),
+                int(location.getX() // size), int(location.getY() // size),
+                int(location.getZ() // size))
+    except Exception:
+        return None
+
+
+def _prune_mob_reward_state(now):
+    for player_uuid, records in list(mob_reward_history.items()):
+        kept = [record for record in records
+                if now - record.get("time", 0.0) <= MOB_BOSS_WINDOW_SECONDS]
+        if kept:
+            mob_reward_history[player_uuid] = kept
+        else:
+            mob_reward_history.pop(player_uuid, None)
+    for area_key, timestamps in list(mob_reward_area_history.items()):
+        kept = [stamp for stamp in timestamps if now - stamp <= MOB_REWARD_WINDOW_SECONDS]
+        if kept:
+            mob_reward_area_history[area_key] = kept
+        else:
+            mob_reward_area_history.pop(area_key, None)
+
+
+def _mob_hourly_total(player_uuid, now):
+    return round(sum([
+        float(record.get("amount", 0.0))
+        for record in mob_reward_history.get(str(player_uuid), [])
+        if now - float(record.get("time", 0.0)) <= MOB_BOSS_WINDOW_SECONDS
+    ]), 2)
+
+
+def _same_type_density(entity, mob_type):
+    try:
+        radius = MOB_REWARD_DENSITY_RADIUS
+        nearby = entity.getWorld().getNearbyEntities(entity.getLocation(), radius, radius, radius)
+        count = 1
+        for other in nearby:
+            try:
+                if other.getUniqueId() != entity.getUniqueId() and str(other.getType().name()) == mob_type:
+                    count += 1
+                    if count >= MOB_REWARD_DENSITY_LIMIT:
+                        return count
+            except Exception:
+                pass
+        return count
+    except Exception:
+        return 1
+
+
+def _mob_reward_allowed(player, entity, mob_type, amount, is_boss, now):
+    spawn_reason = _mob_spawn_reason(entity)
+    player_uuid = str(player.getUniqueId())
+    records = mob_reward_history.get(player_uuid, [])
+    if is_boss:
+        boss_count = len([record for record in records
+                          if record.get("boss") and now - record.get("time", 0.0) <= MOB_BOSS_WINDOW_SECONDS])
+        if boss_count >= MOB_BOSS_LIMIT:
+            return False, u"boss_hour_limit", spawn_reason
+        return True, u"ok", spawn_reason
+
+    if spawn_reason in MOB_NO_REWARD_SPAWN_REASONS:
+        return False, u"spawn_reason=" + to_unicode(spawn_reason), spawn_reason
+
+    if _same_type_density(entity, mob_type) >= MOB_REWARD_DENSITY_LIMIT:
+        return False, u"mob_density", spawn_reason
+
+    recent = [record for record in records
+              if not record.get("boss") and now - record.get("time", 0.0) <= MOB_REWARD_WINDOW_SECONDS]
+    if len(recent) >= MOB_REWARD_KILL_LIMIT:
+        return False, u"player_kill_rate", spawn_reason
+    if recent and sum([float(record.get("amount", 0.0)) for record in recent]) + amount > MOB_REWARD_MONEY_LIMIT:
+        return False, u"player_money_rate", spawn_reason
+
+    area_key = _mob_area_key(entity.getLocation())
+    if area_key is not None and len(mob_reward_area_history.get(area_key, [])) >= MOB_REWARD_AREA_LIMIT:
+        return False, u"area_kill_rate", spawn_reason
+    return True, u"ok", spawn_reason
+
+
+def _warn_mob_reward_blocked(player, reason=None):
+    player_uuid = str(player.getUniqueId())
+    now = time.time()
+    if mob_reward_warning_until.get(player_uuid, 0.0) > now:
+        return
+    mob_reward_warning_until[player_uuid] = now + 15.0
+    try:
+        message = (u"&cЛимит наград за мобов: &f1000$ за последние 60 минут."
+                   if reason == "hourly_money_limit" else
+                   u"&cНаграда не выдана: обнаружена ферма или достигнут временный лимит.")
+        player.sendActionBar(to_java_string(colorize(message)))
+    except Exception:
+        pass
+
+
+def on_mob_death(event):
+    try:
+        entity = event.getEntity()
+        killer = entity.getKiller() if entity is not None else None
+        if killer is None or not isinstance(killer, Player):
+            return
+        mob_type = str(entity.getType().name())
+        reward_data = MOB_REWARDS.get(mob_type)
+        if reward_data is None:
+            return
+
+        minimum, maximum, is_boss = reward_data
+        amount = round(random.uniform(float(minimum), float(maximum)), 2)
+        now = time.time()
+        _prune_mob_reward_state(now)
+        player_uuid = str(killer.getUniqueId())
+        hourly_total = _mob_hourly_total(player_uuid, now)
+        hourly_remaining = round(max(0.0, MOB_REWARD_HOURLY_LIMIT - hourly_total), 2)
+        if hourly_remaining <= 0.0:
+            _warn_mob_reward_blocked(killer, "hourly_money_limit")
+            return
+        original_amount = amount
+        amount = min(amount, hourly_remaining)
+        hourly_clamped = amount < original_amount
+        allowed, reason, spawn_reason = _mob_reward_allowed(
+            killer, entity, mob_type, amount, bool(is_boss), now)
+        if not allowed:
+            _warn_mob_reward_blocked(killer, reason)
+            return
+
+        economy = EconomyManager()
+        success, new_balance = economy.deposit_checked(player_uuid, amount, killer.getName())
+        if not success:
+            log_error(u"Could not credit mob reward to {0}.".format(killer.getName()))
+            return
+
+        mob_reward_history.setdefault(player_uuid, []).append({
+            "time": now, "amount": amount, "boss": bool(is_boss)
+        })
+        _save_mob_reward_history()
+        if not is_boss:
+            area_key = _mob_area_key(entity.getLocation())
+            if area_key is not None:
+                mob_reward_area_history.setdefault(area_key, []).append(now)
+
+        display_name = MOB_DISPLAY_NAMES.get(mob_type, to_unicode(mob_type.replace("_", " ")))
+        log_transaction("MOB_KILL", "SERVER", killer.getName(), amount,
+                        reason=u"{0}; spawn={1}; hourly={2:.2f}/{3:.2f}; clamped={4}".format(
+                            mob_type, spawn_reason, hourly_total + amount,
+                            MOB_REWARD_HOURLY_LIMIT, hourly_clamped),
+                        new_bal_to=new_balance)
+        try:
+            suffix = u" &c(часовой лимит достигнут)" if hourly_clamped else u""
+            killer.sendActionBar(to_java_string(colorize(
+                u"&a+{0} &7за убийство: &f{1}{2}".format(
+                    format_currency(amount), display_name, suffix))))
+        except Exception:
+            killer.sendMessage(to_java_string(colorize(
+                u"&a+{0} &7\u0437\u0430 \u0443\u0431\u0438\u0439\u0441\u0442\u0432\u043e \u043c\u043e\u0431\u0430.".format(format_currency(amount)))))
+    except Exception as exc:
+        log_error(u"Mob reward handler failed: {0}".format(exc))
+
+
 def send_message(recipient, key, **kwargs):
     if key in EconomyConfig.MESSAGES:
         raw = EconomyConfig.MESSAGES[key]
@@ -540,175 +803,374 @@ class EconomyManager(object):
         if getattr(self, "_initialized", False):
             return
         self._initialized = True
+        # On a real server the manager becomes active only from on_enable(),
+        # after it is published in JVM properties. A plain Python import from
+        # another script must never resurrect an unloaded economy.
+        self._active = not JAVA_STRING_AVAILABLE
+        self._lock = threading.RLock()
+        self._saving = False
+        self._primary_database_valid = False
         self.accounts = {}
         self.name_to_uuid = {}
         self.jackpot_bank = 0.0
         self.payday_amount = float(EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
-        # Порог неактивности для payday — модифицируется командой /eco afk-threshold.
         self.payday_afk_threshold = float(EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
-        # Истинный дефолт PLAYERS_SLEEPING_PERCENTAGE per-world. Настраивается
-        # через /eco sleep-default. Хранится в JSON, чтобы переживать релоад.
-        # world_name -> percent (1..100)
         self.sleep_defaults = {}
-        self.load_database()
+        self._database_loaded = self.load_database()
+
+    def _published_manager(self):
+        if not JAVA_STRING_AVAILABLE or System is None:
+            return self if self._active else None
+        try:
+            props = System.getProperties()
+            manager = props.get("PySpigot_EconomyManager")
+            if manager is None:
+                manager = props.get("SmartY_EconomyManager")
+            return manager
+        except Exception:
+            return self if self._active else None
+
+    def current_manager(self):
+        manager = self._published_manager()
+        if manager is not None and manager is not self:
+            try:
+                if manager.is_active():
+                    return manager
+            except Exception:
+                return None
+        return self if self._active else None
+
+    def is_active(self):
+        manager = self._published_manager()
+        return bool(self._active and (manager is None or manager is self))
+
+    def deactivate(self):
+        self._active = False
+
+    def _load_json(self, path):
+        with open(path, "r") as handle:
+            data = json.load(handle, parse_constant=reject_json_constant)
+        if not isinstance(data, dict) or not isinstance(data.get("accounts", {}), dict):
+            raise ValueError("invalid economy database root")
+        return data
 
     def load_database(self):
-        self.accounts.clear()
-        self.name_to_uuid.clear()
-
         if not os.path.exists(EconomyConfig.DATA_DIR):
             try:
                 os.makedirs(EconomyConfig.DATA_DIR)
             except Exception:
                 pass
 
-        if not os.path.exists(EconomyConfig.DB_FILE):
-            self.save_database()
-            return
+        data = None
+        source = EconomyConfig.DB_FILE
+        if os.path.exists(source):
+            try:
+                data = self._load_json(source)
+                self._primary_database_valid = True
+            except Exception as exc:
+                log_error(u"Error reading economy.json: {0}".format(exc))
 
+        if data is None and os.path.exists(EconomyConfig.DB_BACKUP_FILE):
+            try:
+                data = self._load_json(EconomyConfig.DB_BACKUP_FILE)
+                log_error(u"Loaded economy database from backup; primary file was unavailable or damaged.")
+            except Exception as exc:
+                log_error(u"Error reading economy backup: {0}".format(exc))
+
+        # Never clear a live in-memory database after a failed read.
+        if data is None:
+            return not os.path.exists(EconomyConfig.DB_FILE)
+
+        loaded_accounts = {}
+        loaded_names = {}
+        loaded_sleep_defaults = {}
         try:
-            with open(EconomyConfig.DB_FILE, "r") as f:
-                data = json.load(f)
-                # ФИКС: если в старом JSON уже успел сохраниться NaN (баг до патча),
-                # при загрузке банк сбрасывается на 0.0 вместо застревания в NaN навсегда.
-                self.jackpot_bank = safe_amount(data.get("jackpot_bank", 0.0), default=0.0)
-                self.payday_amount = float(data.get("payday_amount", EconomyConfig.DEFAULT_PAYDAY_AMOUNT))
-                self.payday_afk_threshold = float(data.get("payday_afk_threshold", EconomyConfig.DEFAULT_PAYDAY_INACTIVITY))
-                sd_raw = data.get("sleep_defaults", {}) or {}
-                if isinstance(sd_raw, dict):
-                    for wn, pct in sd_raw.items():
-                        try:
-                            self.sleep_defaults[to_unicode(wn)] = max(1, min(100, int(pct)))
-                        except Exception:
-                            pass
-                accs = data.get("accounts", {})
-                for uuid_str, acc_dict in accs.items():
-                    acc = Account.from_dict(acc_dict)
-                    self.accounts[uuid_str] = acc
-                    if acc.name:
-                        self.name_to_uuid[acc.name.lower()] = uuid_str
-        except Exception as e:
-            log_error(u"Error reading economy.json: {0}".format(e))
+            for uuid_str, acc_dict in data.get("accounts", {}).items():
+                if not isinstance(acc_dict, dict):
+                    continue
+                acc = Account.from_dict(acc_dict)
+                acc.balance = max(EconomyConfig.MIN_BALANCE, min(EconomyConfig.MAX_BALANCE, acc.balance))
+                if acc.payday_progress_seconds >= EconomyConfig.PAYDAY_INTERVAL_SECONDS:
+                    acc.payday_progress_seconds = acc.payday_progress_seconds % EconomyConfig.PAYDAY_INTERVAL_SECONDS
+                loaded_accounts[str(uuid_str)] = acc
+                if acc.name:
+                    loaded_names[acc.name.lower()] = str(uuid_str)
+            for world_name, percent in (data.get("sleep_defaults", {}) or {}).items():
+                loaded_sleep_defaults[to_unicode(world_name)] = max(1, min(100, int(percent)))
+        except Exception as exc:
+            log_error(u"Economy database validation failed: {0}".format(exc))
+            return False
+
+        self._lock.acquire()
+        try:
+            self.accounts = loaded_accounts
+            self.name_to_uuid = loaded_names
+            self.jackpot_bank = safe_amount(data.get("jackpot_bank", 0.0), default=0.0)
+            self.payday_amount = safe_amount(data.get("payday_amount", EconomyConfig.DEFAULT_PAYDAY_AMOUNT), default=EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
+            self.payday_afk_threshold = safe_amount(data.get("payday_afk_threshold", EconomyConfig.DEFAULT_PAYDAY_INACTIVITY), default=EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
+            self.sleep_defaults = loaded_sleep_defaults
+        finally:
+            self._lock.release()
+        return True
+
+    def _database_payload(self):
+        return {
+            "schema_version": 2,
+            "saved_at": int(time.time()),
+            "jackpot_bank": round(safe_amount(self.jackpot_bank, 0.0), 2),
+            "payday_amount": round(float(self.payday_amount), 2),
+            "payday_afk_threshold": round(float(self.payday_afk_threshold), 1),
+            "sleep_defaults": {str(wn): int(pct) for wn, pct in self.sleep_defaults.items()},
+            "accounts": {uuid_str: acc.to_dict() for uuid_str, acc in self.accounts.items()}
+        }
 
     def save_database(self):
+        if not self._database_loaded:
+            log_error(u"Refusing to overwrite an economy database that failed to load.")
+            return False
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return manager.save_database()
+        if manager is None or self._saving:
+            return False
+
+        self._lock.acquire()
+        temp_file = EconomyConfig.DB_FILE + ".tmp"
         try:
+            self._saving = True
             if not os.path.exists(EconomyConfig.DATA_DIR):
                 os.makedirs(EconomyConfig.DATA_DIR)
+            payload = self._database_payload()
+            with open(temp_file, "w") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
 
-            data_to_write = {
-                "jackpot_bank": self.jackpot_bank,
-                "payday_amount": round(float(self.payday_amount), 2),
-                "payday_afk_threshold": round(float(self.payday_afk_threshold), 1),
-                "sleep_defaults": {str(wn): int(pct) for wn, pct in self.sleep_defaults.items()},
-                "accounts": {uuid_str: acc.to_dict() for uuid_str, acc in self.accounts.items()}
-            }
-
-            temp_file = EconomyConfig.DB_FILE + ".tmp"
-            with open(temp_file, "w") as f:
-                json.dump(data_to_write, f, indent=2, ensure_ascii=False)
+            if self._primary_database_valid and os.path.exists(EconomyConfig.DB_FILE):
+                backup_tmp = EconomyConfig.DB_BACKUP_FILE + ".tmp"
+                try:
+                    with open(EconomyConfig.DB_FILE, "rb") as source:
+                        with open(backup_tmp, "wb") as target:
+                            target.write(source.read())
+                            target.flush()
+                            try:
+                                os.fsync(target.fileno())
+                            except Exception:
+                                pass
+                    if hasattr(os, "replace"):
+                        os.replace(backup_tmp, EconomyConfig.DB_BACKUP_FILE)
+                    else:
+                        os.rename(backup_tmp, EconomyConfig.DB_BACKUP_FILE)
+                except Exception as backup_exc:
+                    log_error(u"Could not update economy backup: {0}".format(backup_exc))
 
             if hasattr(os, "replace"):
                 os.replace(temp_file, EconomyConfig.DB_FILE)
             else:
-                if os.path.exists(EconomyConfig.DB_FILE):
-                    try:
-                        os.remove(EconomyConfig.DB_FILE)
-                    except Exception:
-                        pass
+                # POSIX rename replaces atomically and avoids a window with no DB file.
                 os.rename(temp_file, EconomyConfig.DB_FILE)
-        except Exception as e:
-            log_error(u"Error saving economy.json: {0}".format(e))
+            self._primary_database_valid = True
+            return True
+        except Exception as exc:
+            log_error(u"Error saving economy.json: {0}".format(exc))
+            return False
+        finally:
+            self._saving = False
+            self._lock.release()
 
-    def get_or_create_account(self, uuid_str, name):
+    def _get_or_create_in_memory(self, uuid_str, name):
         uuid_key = str(uuid_str)
         unicode_name = to_unicode(name)
-
-        if uuid_key in self.accounts:
-            acc = self.accounts[uuid_key]
-            acc.update_last_seen(unicode_name)
-            if unicode_name and unicode_name != u"Unknown":
-                self.name_to_uuid[unicode_name.lower()] = uuid_key
-            return acc
-        else:
+        acc = self.accounts.get(uuid_key)
+        created = acc is None
+        if created:
             acc = Account(uuid_key, unicode_name)
             self.accounts[uuid_key] = acc
-            if unicode_name and unicode_name != u"Unknown":
-                self.name_to_uuid[unicode_name.lower()] = uuid_key
-            self.save_database()
+        else:
+            acc.update_last_seen(unicode_name)
+        if unicode_name and unicode_name != u"Unknown":
+            self.name_to_uuid[unicode_name.lower()] = uuid_key
+        return acc, created
+
+    def get_or_create_account(self, uuid_str, name):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return manager.get_or_create_account(uuid_str, name)
+        if manager is None:
+            return None
+        self._lock.acquire()
+        try:
+            acc, created = self._get_or_create_in_memory(uuid_str, name)
+            if created and not self.save_database():
+                self.accounts.pop(str(uuid_str), None)
+                return None
             return acc
+        finally:
+            self._lock.release()
 
     def get_account_by_name(self, name):
-        if not name:
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return manager.get_account_by_name(name)
+        if manager is None or not name:
             return None
         lower_name = to_unicode(name).lower()
         uuid_key = self.name_to_uuid.get(lower_name)
         if uuid_key and uuid_key in self.accounts:
             return self.accounts[uuid_key]
-
         for acc in self.accounts.values():
             if acc.name and acc.name.lower() == lower_name:
                 self.name_to_uuid[lower_name] = acc.uuid
                 return acc
-
         if BUKKIT_AVAILABLE:
             try:
-                for p in Bukkit.getOnlinePlayers():
-                    if p.getName().lower() == lower_name:
-                        return self.get_or_create_account(str(p.getUniqueId()), p.getName())
+                for player in Bukkit.getOnlinePlayers():
+                    if player.getName().lower() == lower_name:
+                        return self.get_or_create_account(str(player.getUniqueId()), player.getName())
             except Exception:
                 pass
-
         return None
 
     def get_balance(self, uuid_str):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return manager.get_balance(uuid_str)
+        if manager is None:
+            return 0.0
         acc = self.accounts.get(str(uuid_str))
         return acc.balance if acc else 0.0
 
     def has_enough(self, uuid_str, amount):
-        # ФИКС: safe_amount() отсекает NaN/Infinity ДО сравнения. Без этого
-        # "balance >= float('nan')" всегда False, но некоторые вызовы этот
-        # False молча игнорировали выше по стеку (см. casino.py) — теперь
-        # такая "ставка" считается некорректной (0.0) на самом раннем этапе.
         safe = safe_amount(amount, default=None)
-        if safe is None:
-            return False
-        return self.get_balance(uuid_str) >= safe
+        return safe is not None and safe > 0.0 and self.get_balance(uuid_str) >= safe
+
+    def deposit_checked(self, uuid_str, amount, name=None):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            if hasattr(manager, "deposit_checked"):
+                return manager.deposit_checked(uuid_str, amount, name)
+            return True, manager.deposit(uuid_str, amount, name)
+        safe = safe_amount(amount, default=None)
+        if manager is None or safe is None or safe <= 0.0:
+            return False, self.get_balance(uuid_str)
+
+        uuid_key = str(uuid_str)
+        self._lock.acquire()
+        try:
+            acc, created = self._get_or_create_in_memory(uuid_key, name if name else u"Unknown")
+            old_balance = acc.balance
+            new_balance = old_balance + safe
+            if new_balance > EconomyConfig.MAX_BALANCE:
+                if created:
+                    self.accounts.pop(uuid_key, None)
+                return False, old_balance
+            acc.balance = round(new_balance, 2)
+            if not self.save_database():
+                acc.balance = old_balance
+                if created:
+                    self.accounts.pop(uuid_key, None)
+                return False, old_balance
+        finally:
+            self._lock.release()
+        update_online_player_hud(uuid_key)
+        invalidate_baltop_cache()
+        return True, acc.balance
 
     def deposit(self, uuid_str, amount, name=None):
-        # ФИКС дыры дублирования денег (NaN -> MAX_BALANCE): раньше
-        # min(MAX_BALANCE, balance + float('nan')) возвращал MAX_BALANCE
-        # из-за особенностей сравнения Python с NaN внутри min(). Теперь
-        # некорректная сумма превращается в 0.0 ДО арифметики.
-        safe = safe_amount(amount, default=0.0)
-        acc = self.get_or_create_account(uuid_str, name if name else u"Unknown")
-        acc.balance = min(EconomyConfig.MAX_BALANCE, acc.balance + safe)
-        self.save_database()
-        update_online_player_hud(uuid_str)
-        invalidate_baltop_cache()
-        return acc.balance
+        success, balance = self.deposit_checked(uuid_str, amount, name)
+        return balance
 
     def withdraw(self, uuid_str, amount):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return bool(manager.withdraw(uuid_str, amount))
+        safe = safe_amount(amount, default=None)
         uuid_key = str(uuid_str)
-        # ФИКС: has_enough() теперь сам отсекает NaN/Infinity, поэтому
-        # withdraw(nan) корректно вернет False и баланс не пострадает.
-        if not self.has_enough(uuid_key, amount):
+        if manager is None or safe is None or safe <= 0.0:
             return False
-        safe = safe_amount(amount, default=0.0)
-        acc = self.accounts[uuid_key]
-        acc.balance = max(EconomyConfig.MIN_BALANCE, acc.balance - safe)
-        self.save_database()
+        self._lock.acquire()
+        try:
+            acc = self.accounts.get(uuid_key)
+            if acc is None or acc.balance < safe:
+                return False
+            old_balance = acc.balance
+            acc.balance = round(old_balance - safe, 2)
+            if not self.save_database():
+                acc.balance = old_balance
+                return False
+        finally:
+            self._lock.release()
         update_online_player_hud(uuid_key)
         invalidate_baltop_cache()
         return True
 
-    def set_balance(self, uuid_str, amount, name=None):
-        safe = safe_amount(amount, default=EconomyConfig.MIN_BALANCE)
-        acc = self.get_or_create_account(uuid_str, name if name else u"Unknown")
-        acc.balance = max(EconomyConfig.MIN_BALANCE, min(EconomyConfig.MAX_BALANCE, safe))
-        self.save_database()
-        update_online_player_hud(uuid_str)
+    def transfer(self, from_uuid, to_uuid, amount, to_name=None):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            if hasattr(manager, "transfer"):
+                return manager.transfer(from_uuid, to_uuid, amount, to_name)
+            return False, 0.0, 0.0
+        safe = safe_amount(amount, default=None)
+        if manager is None or safe is None or safe <= 0.0 or str(from_uuid) == str(to_uuid):
+            return False, self.get_balance(from_uuid), self.get_balance(to_uuid)
+        from_key, to_key = str(from_uuid), str(to_uuid)
+        self._lock.acquire()
+        try:
+            source = self.accounts.get(from_key)
+            if source is None or source.balance < safe:
+                return False, self.get_balance(from_key), self.get_balance(to_key)
+            target, created = self._get_or_create_in_memory(to_key, to_name if to_name else u"Unknown")
+            if target.balance + safe > EconomyConfig.MAX_BALANCE:
+                if created:
+                    self.accounts.pop(to_key, None)
+                return False, source.balance, target.balance
+            old_source, old_target = source.balance, target.balance
+            source.balance = round(old_source - safe, 2)
+            target.balance = round(old_target + safe, 2)
+            if not self.save_database():
+                source.balance, target.balance = old_source, old_target
+                if created:
+                    self.accounts.pop(to_key, None)
+                return False, old_source, old_target
+        finally:
+            self._lock.release()
+        update_online_player_hud(from_key)
+        update_online_player_hud(to_key)
         invalidate_baltop_cache()
-        return acc.balance
+        return True, source.balance, target.balance
+
+    def set_balance_checked(self, uuid_str, amount, name=None):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            if hasattr(manager, "set_balance_checked"):
+                return manager.set_balance_checked(uuid_str, amount, name)
+            return True, manager.set_balance(uuid_str, amount, name)
+        safe = safe_amount(amount, default=None)
+        if manager is None or safe is None or safe < EconomyConfig.MIN_BALANCE or safe > EconomyConfig.MAX_BALANCE:
+            return False, self.get_balance(uuid_str)
+        uuid_key = str(uuid_str)
+        self._lock.acquire()
+        try:
+            acc, created = self._get_or_create_in_memory(uuid_key, name if name else u"Unknown")
+            old_balance = acc.balance
+            acc.balance = round(safe, 2)
+            if not self.save_database():
+                acc.balance = old_balance
+                if created:
+                    self.accounts.pop(uuid_key, None)
+                return False, old_balance
+        finally:
+            self._lock.release()
+        update_online_player_hud(uuid_key)
+        invalidate_baltop_cache()
+        return True, acc.balance
+
+    def set_balance(self, uuid_str, amount, name=None):
+        success, balance = self.set_balance_checked(uuid_str, amount, name)
+        return balance
 
     def get_payday_amount(self):
         # ФИКС "большой Payday": сумма зафиксирована жёстко и не читается из
@@ -726,20 +1188,29 @@ class EconomyManager(object):
         return float(EconomyConfig.DEFAULT_PAYDAY_AMOUNT)
 
     def add_to_jackpot(self, amount):
-        # ФИКС: раньше "self.jackpot_bank += float('nan')" НАВСЕГДА портил
-        # банк джекпота в NaN — банк уже никогда не восстанавливался, а
-        # следующий выигрыш джекпота выплачивал бы NaN (->MAX_BALANCE игроку).
-        safe = safe_amount(amount, default=0.0)
-        self.jackpot_bank = safe_amount(self.jackpot_bank + safe, default=self.jackpot_bank)
-        self.save_database()
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return manager.add_to_jackpot(amount)
+        safe = safe_amount(amount, default=None)
+        if manager is None or safe is None:
+            return self.jackpot_bank
+        old_bank = self.jackpot_bank
+        self.jackpot_bank = max(0.0, safe_amount(old_bank + safe, default=old_bank))
+        if not self.save_database():
+            self.jackpot_bank = old_bank
         return self.jackpot_bank
 
     def claim_jackpot(self, bet):
+        manager = self.current_manager()
+        if manager is not None and manager is not self:
+            return manager.claim_jackpot(bet)
         safe_bet = safe_amount(bet, default=0.0)
         safe_bank = safe_amount(self.jackpot_bank, default=0.0)
         payout = safe_bet + safe_bank
         self.jackpot_bank = 0.0
-        self.save_database()
+        if not self.save_database():
+            self.jackpot_bank = safe_bank
+            return 0.0
         return payout
 
 
@@ -816,6 +1287,9 @@ def create_component(text):
 payday_task_id = -1
 afk_task_id = -1
 hud_task_id = -1
+payday_task_obj = None
+afk_task_obj = None
+hud_task_obj = None
 
 
 # ФИКС "большой payday": до исправления бага с /pyspigot unload у этого скрипта не было
@@ -1073,7 +1547,12 @@ def mark_player_active(player, force=False):
 
 
 class AfkRunnable(Runnable):
+    def __init__(self, owner):
+        self.owner = owner
+
     def run(self):
+        if self.owner is None or not self.owner.is_active():
+            return
         try:
             now = time.time()
             for player in Bukkit.getOnlinePlayers():
@@ -1114,13 +1593,24 @@ def clear_balance_hud(player):
         log_error(u"Error clearing balance HUD: {0}".format(e))
 
 
+_hud_file_cache = {}
+
+
 def read_json_file(path, default_value):
+    now = time.time()
+    cached = _hud_file_cache.get(path)
+    if cached is not None and now - cached[0] < EconomyConfig.HUD_FILE_CACHE_TTL:
+        return cached[1]
     if not os.path.exists(path):
         return default_value
     try:
         with open(path, "r") as handle:
-            return json.load(handle)
+            data = json.load(handle)
+            _hud_file_cache[path] = (now, data)
+            return data
     except Exception:
+        if cached is not None:
+            return cached[1]
         return default_value
 
 
@@ -1155,10 +1645,23 @@ def get_player_town_profile(uuid_str):
 
 def get_company_share_price(company):
     try:
-        available = int(company.get("available_shares", 10000))
+        total = 10000
+        available = max(0, min(total, int(company.get("available_shares", total))))
+        issued = total - available
         start_price = float(company.get("start_price", 10.0))
-        backing = float(company.get("balance", 0.0)) + float(available) * start_price
-        return max(1.0, round(backing / 10000.0, 2))
+        balance = float(company.get("balance", 0.0))
+        if "price_offset" not in company:
+            if company.get("share_price") is not None:
+                migrated_price = float(company.get("share_price"))
+                if migrated_price == migrated_price and migrated_price not in (float("inf"), float("-inf")):
+                    return max(1.0, round(migrated_price, 6))
+            return max(1.0, round((balance + available * start_price) / float(total), 6))
+        offset = float(company.get("price_offset", 0.0))
+        values = (start_price, balance, offset)
+        if any(value != value or value == float("inf") or value == float("-inf") for value in values):
+            return 0.0
+        price = start_price + balance / float(total) + issued * start_price / float(total) + offset
+        return max(1.0, round(price, 6))
     except Exception:
         return 0.0
 
@@ -1186,8 +1689,9 @@ def update_balance_hud(player):
             return
 
         economy = EconomyManager()
-        economy.load_database()
         acc = economy.get_or_create_account(uuid_str, name)
+        if acc is None:
+            return
         if not acc.show_hud:
             return
 
@@ -1228,22 +1732,39 @@ def update_balance_hud(player):
 
 
 class PaydayRunnable(Runnable):
+    def __init__(self, owner):
+        self.owner = owner
+
     def run(self):
+        if self.owner is None or not self.owner.is_active():
+            return
+        now = time.time()
         try:
-            eco = EconomyManager()
-            now = time.time()
+            eco = self.owner
 
             for p in Bukkit.getOnlinePlayers():
                 if p and p.isOnline():
-                    process_player_payday(eco, p, now, True)
+                    process_player_payday(eco, p, now, True, False)
             eco.save_database()
 
         except Exception as e:
             log_error(u"Error in PaydayRunnable: {0}".format(e))
 
+        # Heartbeat ограничивает ошибку last-seen примерно одной минутой даже
+        # после аварийного завершения, когда PlayerQuitEvent/on_disable не успели.
+        try:
+            checkpoint_online_last_seen(now)
+        except Exception as e:
+            log_error(u"Error in last-seen heartbeat: {0}".format(e))
+
 
 class HudRunnable(Runnable):
+    def __init__(self, owner):
+        self.owner = owner
+
     def run(self):
+        if self.owner is None or not self.owner.is_active():
+            return
         try:
             if not BUKKIT_AVAILABLE:
                 return
@@ -1251,6 +1772,18 @@ class HudRunnable(Runnable):
                 update_balance_hud(player)
         except Exception as e:
             log_error(u"Error in HudRunnable: {0}".format(e))
+
+
+def run_managed_payday(owner):
+    PaydayRunnable(owner).run()
+
+
+def run_managed_afk(owner):
+    AfkRunnable(owner).run()
+
+
+def run_managed_hud(owner):
+    HudRunnable(owner).run()
 
 
 # Сколько секунд бездействия УЖЕ означает "не начисляем payday" (даже
@@ -1279,7 +1812,7 @@ def _is_recently_active(uuid_str, now, threshold=None):
         return False
 
 
-def process_player_payday(economy, player, now=None, notify=True):
+def process_player_payday(economy, player, now=None, notify=True, persist=True):
     if not BUKKIT_AVAILABLE or player is None:
         return 0
     if now is None:
@@ -1290,14 +1823,18 @@ def process_player_payday(economy, player, now=None, notify=True):
         return 0
 
     acc = economy.get_or_create_account(uuid_str, name)
+    if acc is None:
+        return 0
     last_check = float(getattr(acc, "last_payday_check_timestamp", 0.0))
     if last_check <= 0.0 or last_check > now:
         acc.last_payday_check_timestamp = now
-        economy.save_database()
+        if persist:
+            economy.save_database()
         return 0
     if is_player_afk(player):
         acc.last_payday_check_timestamp = now
-        economy.save_database()
+        if persist:
+            economy.save_database()
         return 0
 
     # Защита от стоящих на месте: если игрок не двигался последние N сек
@@ -1306,30 +1843,40 @@ def process_player_payday(economy, player, now=None, notify=True):
     # через 10 мин, а прогресс payday должен замирать сразу.
     if not _is_recently_active(uuid_str, now):
         acc.last_payday_check_timestamp = now
-        economy.save_database()
+        if persist:
+            economy.save_database()
         return 0
 
-    elapsed = max(0.0, now - last_check)
+    elapsed = min(
+        EconomyConfig.PAYDAY_MAX_ELAPSED_SECONDS,
+        max(0.0, now - last_check)
+    )
     acc.last_payday_check_timestamp = now
     acc.payday_progress_seconds = max(0.0, float(getattr(acc, "payday_progress_seconds", 0.0)) + elapsed)
 
     payouts = 0
     interval = float(EconomyConfig.PAYDAY_INTERVAL_SECONDS)
-    while acc.payday_progress_seconds >= interval:
-        acc.payday_progress_seconds -= interval
+    if acc.payday_progress_seconds >= interval:
+        # Corrupted/stale timers must never release a backlog of many paydays.
+        acc.payday_progress_seconds = acc.payday_progress_seconds % interval
         acc.last_payday_timestamp = now
-        payouts += 1
+        payouts = 1
 
     acc.playtime_minutes = int(acc.payday_progress_seconds // 60)
 
     if payouts > 0:
-        amount = economy.get_payday_amount() * payouts
-        new_balance = economy.deposit(uuid_str, amount, name)
+        amount = economy.get_payday_amount()
+        success, new_balance = economy.deposit_checked(uuid_str, amount, name)
+        if not success:
+            acc.payday_progress_seconds = min(interval - 1.0, acc.payday_progress_seconds + interval)
+            economy.save_database()
+            return 0
         if notify:
             send_message(player, "payday_received", amount=format_currency(amount), balance=format_currency(new_balance))
             safe_play_sound(player, ["ENTITY_PLAYER_LEVELUP", "LEVEL_UP"], 1.0, 1.0)
     else:
-        economy.save_database()
+        if persist:
+            economy.save_database()
 
     return payouts
 
@@ -1351,28 +1898,42 @@ def reset_online_payday_checks():
 
 
 def start_payday_timer():
-    global payday_task_id
-    stop_payday_timer()
-    # ФИКС "большого payday": дополнительно отменяем любой таймер от
-    # ПРЕДЫДУЩЕЙ загрузки этого скрипта в этой же JVM (см. _SYS_PROP_PAYDAY_TASK) —
-    # обычная переменная payday_task_id обнуляется при каждой перезагрузке
-    # модуля, поэтому stop_payday_timer() выше не видит старый таймер из ПРОШЛОЙ загрузки.
+    global payday_task_id, payday_task_obj
+    # Сначала отменяем задачу от предыдущей загрузки: stop_payday_timer()
+    # очищает System property и после него старый ID уже будет недоступен.
     _cancel_stale_task_by_system_property(_SYS_PROP_PAYDAY_TASK)
+    stop_payday_timer()
     plugin = get_pyspigot_plugin()
     if plugin:
         try:
             # 1200 тиков = 60 секунд (раз в минуту проверяем и прибавляем +1 мин наигранного времени)
-            task_obj = Bukkit.getScheduler().runTaskTimer(plugin, PaydayRunnable(), 1200, 1200)
-            payday_task_id = task_obj.getTaskId()
+            owner = EconomyManager()
+            payday_task_obj = Bukkit.getScheduler().runTaskTimer(
+                plugin, PaydayRunnable(owner), 1200, 1200
+            )
+            try:
+                payday_task_id = payday_task_obj.getTaskId()
+            except Exception:
+                payday_task_id = -1
             _store_task_id_in_system_property(_SYS_PROP_PAYDAY_TASK, payday_task_id)
             log_info(u"Started Personal Playtime Payday timer task (ID: {0}, period: 60s).".format(payday_task_id))
+            return True
         except Exception as e:
             log_error(u"Failed to start payday timer: {0}".format(e))
+    else:
+        log_error(u"Failed to start payday timer: PySpigot plugin not found.")
+    return False
 
 
 def stop_payday_timer():
-    global payday_task_id
+    global payday_task_id, payday_task_obj
     if BUKKIT_AVAILABLE:
+        if payday_task_obj is not None:
+            try:
+                payday_task_obj.cancel()
+            except Exception:
+                pass
+            payday_task_obj = None
         if payday_task_id != -1:
             try:
                 Bukkit.getScheduler().cancelTask(payday_task_id)
@@ -1384,28 +1945,42 @@ def stop_payday_timer():
 
 
 def start_afk_timer():
-    global afk_task_id
-    stop_afk_timer()
+    global afk_task_id, afk_task_obj
     _cancel_stale_task_by_system_property(_SYS_PROP_AFK_TASK)
+    stop_afk_timer()
     plugin = get_pyspigot_plugin()
     if plugin:
         try:
-            task_obj = Bukkit.getScheduler().runTaskTimer(
+            owner = EconomyManager()
+            afk_task_obj = Bukkit.getScheduler().runTaskTimer(
                 plugin,
-                AfkRunnable(),
+                AfkRunnable(owner),
                 EconomyConfig.AFK_CHECK_PERIOD_TICKS,
                 EconomyConfig.AFK_CHECK_PERIOD_TICKS
             )
-            afk_task_id = task_obj.getTaskId()
+            try:
+                afk_task_id = afk_task_obj.getTaskId()
+            except Exception:
+                afk_task_id = -1
             _store_task_id_in_system_property(_SYS_PROP_AFK_TASK, afk_task_id)
             log_info(u"Started AFK timer task (ID: {0}).".format(afk_task_id))
+            return True
         except Exception as e:
             log_error(u"Failed to start AFK timer: {0}".format(e))
+    else:
+        log_error(u"Failed to start AFK timer: PySpigot plugin not found.")
+    return False
 
 
 def stop_afk_timer():
-    global afk_task_id
+    global afk_task_id, afk_task_obj
     if BUKKIT_AVAILABLE:
+        if afk_task_obj is not None:
+            try:
+                afk_task_obj.cancel()
+            except Exception:
+                pass
+            afk_task_obj = None
         if afk_task_id != -1:
             try:
                 Bukkit.getScheduler().cancelTask(afk_task_id)
@@ -1417,23 +1992,39 @@ def stop_afk_timer():
 
 
 def start_hud_timer():
-    global hud_task_id
-    stop_hud_timer()
+    global hud_task_id, hud_task_obj
     _cancel_stale_task_by_system_property(_SYS_PROP_HUD_TASK)
+    stop_hud_timer()
     plugin = get_pyspigot_plugin()
     if plugin:
         try:
-            task_obj = Bukkit.getScheduler().runTaskTimer(plugin, HudRunnable(), 100, 100)
-            hud_task_id = task_obj.getTaskId()
+            owner = EconomyManager()
+            hud_task_obj = Bukkit.getScheduler().runTaskTimer(
+                plugin, HudRunnable(owner), 200, 200
+            )
+            try:
+                hud_task_id = hud_task_obj.getTaskId()
+            except Exception:
+                hud_task_id = -1
             _store_task_id_in_system_property(_SYS_PROP_HUD_TASK, hud_task_id)
             log_info(u"Started HUD timer task (ID: {0}).".format(hud_task_id))
+            return True
         except Exception as e:
             log_error(u"Failed to start HUD timer: {0}".format(e))
+    else:
+        log_error(u"Failed to start HUD timer: PySpigot plugin not found.")
+    return False
 
 
 def stop_hud_timer():
-    global hud_task_id
+    global hud_task_id, hud_task_obj
     if BUKKIT_AVAILABLE:
+        if hud_task_obj is not None:
+            try:
+                hud_task_obj.cancel()
+            except Exception:
+                pass
+            hud_task_obj = None
         if hud_task_id != -1:
             try:
                 Bukkit.getScheduler().cancelTask(hud_task_id)
@@ -1444,7 +2035,7 @@ def stop_hud_timer():
         _store_task_id_in_system_property(_SYS_PROP_HUD_TASK, -1)
 
 # -----------------------------------------------------------------------------
-# ПРЯМАЯ РЕГИСТРАЦИЯ И СНЯТИЕ BUKKIT EVENT EXECUTOR
+# РЕГИСТРАЦИЯ СОБЫТИЙ (PYSPIGOT MANAGER + BUKKIT FALLBACK)
 # -----------------------------------------------------------------------------
 registered_listeners = []
 
@@ -1455,8 +2046,11 @@ if BUKKIT_AVAILABLE:
     class DirectPyBukkitEventExecutor(EventExecutor):
         def __init__(self, handler_func):
             self.handler_func = handler_func
+            self.owner = EconomyManager()
 
         def execute(self, listener, event):
+            if self.owner is None or not self.owner.is_active():
+                return
             try:
                 self.handler_func(event)
             except Exception as e:
@@ -1473,9 +2067,12 @@ def unregister_script_listeners():
         return
     try:
         from org.bukkit.event import HandlerList
-        for listener in registered_listeners:
+        for listener_kind, listener in registered_listeners:
             try:
-                HandlerList.unregisterAll(listener)
+                if listener_kind == "managed" and PYSPIGOT_MANAGERS_AVAILABLE:
+                    _pyspigot.listener_manager().unregisterListener(listener)
+                else:
+                    HandlerList.unregisterAll(listener)
             except Exception:
                 pass
         del registered_listeners[:]
@@ -1487,6 +2084,13 @@ def register_event_directly(event_class, handler_func):
     if not BUKKIT_AVAILABLE or event_class is None:
         return False
     try:
+        if PYSPIGOT_MANAGERS_AVAILABLE:
+            listener = _pyspigot.listener_manager().registerListener(
+                handler_func, event_class, EventPriority.HIGHEST
+            )
+            registered_listeners.append(("managed", listener))
+            return True
+
         plugin = get_pyspigot_plugin()
         if not plugin:
             log_error(u"Could not find PySpigot plugin for event registration!")
@@ -1503,7 +2107,7 @@ def register_event_directly(event_class, handler_func):
             executor,
             plugin
         )
-        registered_listeners.append(dummy_listener)
+        registered_listeners.append(("direct", dummy_listener))
         log_info(u"Successfully registered event listener for {0}".format(
             event_class.getSimpleName() if hasattr(event_class, "getSimpleName") else str(event_class)
         ))
@@ -1572,9 +2176,20 @@ class LastSeenManager(object):
             temp_file = self.file_path + ".tmp"
             with open(temp_file, "w") as f:
                 json.dump(self.data, f, indent=2)
-            if os.path.exists(self.file_path):
-                os.remove(self.file_path)
-            os.rename(temp_file, self.file_path)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            if hasattr(os, "replace"):
+                os.replace(temp_file, self.file_path)
+            else:
+                try:
+                    os.rename(temp_file, self.file_path)
+                except OSError:
+                    if os.path.exists(self.file_path):
+                        os.remove(self.file_path)
+                    os.rename(temp_file, self.file_path)
         except Exception as e:
             log_error(u"Error saving last_seen.json: {0}".format(e))
 
@@ -1582,8 +2197,54 @@ class LastSeenManager(object):
         return self.data.get(str(uuid_str))
 
     def update_last_seen(self, uuid_str):
-        self.data[str(uuid_str)] = time.time()
-        self.save_data()
+        return self.update_many([uuid_str])
+
+    def update_many(self, uuid_values, timestamp=None):
+        """Обновляет несколько игроков одной атомарной записью файла."""
+        if timestamp is None:
+            timestamp = time.time()
+        try:
+            timestamp = float(timestamp)
+        except (ValueError, TypeError, OverflowError):
+            timestamp = time.time()
+        if timestamp != timestamp or timestamp in (float("inf"), float("-inf")):
+            timestamp = time.time()
+
+        updated = 0
+        for uuid_value in uuid_values:
+            if uuid_value is None:
+                continue
+            uuid_key = str(uuid_value).strip()
+            if not uuid_key:
+                continue
+            self.data[uuid_key] = timestamp
+            updated += 1
+
+        if updated > 0:
+            self.save_data()
+        return updated
+
+
+def checkpoint_online_last_seen(timestamp=None):
+    """Пакетно фиксирует, что текущие онлайн-игроки были на сервере в этот момент."""
+    if not BUKKIT_AVAILABLE:
+        return 0
+    if timestamp is None:
+        timestamp = time.time()
+
+    online_uuids = []
+    try:
+        for player in Bukkit.getOnlinePlayers():
+            if player is None:
+                continue
+            uuid_str, _ = get_sender_uuid_and_name(player)
+            if uuid_str:
+                online_uuids.append(uuid_str)
+    except Exception as e:
+        log_error(u"Error collecting online players for last-seen checkpoint: {0}".format(e))
+        return 0
+
+    return LastSeenManager().update_many(online_uuids, timestamp)
 
 
 def safe_play_sound(player, sound_candidates, volume=1.0, pitch=1.0):
@@ -1648,6 +2309,7 @@ def on_player_join(event):
         log_error(u"Error in PlayerJoinEvent: {0}".format(e))
         import traceback
         traceback.print_exc()
+        raise
 
 
 def on_player_quit(event):
@@ -1660,6 +2322,7 @@ def on_player_quit(event):
             afk_players.pop(uuid_str, None)
             last_activity.pop(uuid_str, None)
             last_location_keys.pop(uuid_str, None)
+            mob_reward_warning_until.pop(uuid_str, None)
             ls_mgr = LastSeenManager()
             ls_mgr.update_last_seen(uuid_str)
             refresh_sleep_rules()
@@ -1730,11 +2393,21 @@ def parse_cmd_args(*args):
     if len(args) == 1:
         return sender, []
 
-    last_arg = args[-1]
-    if isinstance(last_arg, (list, tuple)):
-        return sender, [to_unicode(a) for a in last_arg]
+    # PySpigot 0.9.1 passes (sender, label, java.lang.String[]). A Java array
+    # is iterable in Jython but is not a Python list/tuple. Prefer the last
+    # non-string iterable and never treat the command label as an argument.
+    string_types = (str, unicode, JavaString)
+    for value in reversed(args[1:]):
+        if isinstance(value, string_types):
+            continue
+        try:
+            return sender, [to_unicode(item) for item in value]
+        except (TypeError, AttributeError):
+            pass
 
-    return sender, [to_unicode(a) for a in args[1:]]
+    # Compatibility with old/third-party dispatchers that flatten arguments.
+    start = 2 if len(args) >= 3 and isinstance(args[1], string_types) else 1
+    return sender, [to_unicode(value) for value in args[start:]]
 
 
 def cmd_balance(*args):
@@ -1747,6 +2420,9 @@ def cmd_balance(*args):
             safe_console_send(u"Console does not have a balance. Use /bal <player>")
             return True
         acc = economy.get_or_create_account(sender_uuid, sender_name)
+        if acc is None:
+            send_message(sender, u"{prefix}&cЭкономика сейчас недоступна.")
+            return True
         send_message(sender, "balance_self", formatted_balance=format_currency(acc.balance))
     else:
         target_name = cmd_args[0]
@@ -1771,11 +2447,8 @@ def cmd_pay(*args):
         return True
 
     target_name = cmd_args[0]
-    try:
-        amount = float(cmd_args[1])
-        if amount <= 0:
-            raise ValueError()
-    except ValueError:
+    amount = safe_amount(cmd_args[1], default=None)
+    if amount is None or amount <= 0.0:
         send_message(sender, "invalid_amount")
         return True
 
@@ -1785,6 +2458,9 @@ def cmd_pay(*args):
 
     economy = EconomyManager()
     sender_acc = economy.get_or_create_account(sender_uuid, sender_name)
+    if sender_acc is None:
+        send_message(sender, u"{prefix}&cЭкономика сейчас недоступна.")
+        return True
 
     if not economy.has_enough(sender_uuid, amount):
         send_message(sender, "insufficient_funds", formatted_balance=format_currency(sender_acc.balance))
@@ -1795,16 +2471,18 @@ def cmd_pay(*args):
         send_message(sender, "player_not_found", player=target_name)
         return True
 
-    economy.withdraw(sender_uuid, amount)
-    economy.deposit(target_acc.uuid, amount, target_acc.name)
-
-    new_sender_bal = sender_acc.balance
+    success, new_sender_bal, new_target_bal = economy.transfer(
+        sender_uuid, target_acc.uuid, amount, target_acc.name
+    )
+    if not success:
+        send_message(sender, u"{prefix}&cПеревод не выполнен. Балансы не изменены.")
+        return True
     # Лог транзакции.
     log_transaction(
         u"PAY", sender_name, target_acc.name, amount,
         reason=u"/pay",
         new_bal_from=new_sender_bal,
-        new_bal_to=economy.get_balance(target_acc.uuid),
+        new_bal_to=new_target_bal,
     )
 
     send_message(sender, "pay_success_sender", formatted_amount=format_currency(amount), target=target_acc.name, formatted_balance=format_currency(new_sender_bal))
@@ -1846,15 +2524,16 @@ def cmd_eco(*args):
         if len(cmd_args) < 2:
             sender.sendMessage(to_java_string(colorize(u"&cИспользование: &f/eco afk-threshold <сек>")))
             return True
-        try:
-            secs = float(cmd_args[1])
-        except ValueError:
-            secs = -1.0
-        if secs < 0.0 or secs > 3600.0:
+        secs = safe_amount(cmd_args[1], default=None)
+        if secs is None or secs < 0.0 or secs > 3600.0:
             sender.sendMessage(to_java_string(colorize(u"&cУкажите число секунд от 0 до 3600.")))
             return True
+        old_threshold = economy.payday_afk_threshold
         economy.payday_afk_threshold = secs
-        economy.save_database()
+        if not economy.save_database():
+            economy.payday_afk_threshold = old_threshold
+            sender.sendMessage(to_java_string(colorize(u"&cНе удалось сохранить настройку.")))
+            return True
         sender.sendMessage(to_java_string(colorize(
             u"&a✓ Порог неактивности для payday: &f%.0f сек." % secs)))
         return True
@@ -1913,7 +2592,10 @@ def cmd_eco(*args):
         return True
 
     if sub == "reset":
-        new_bal = economy.set_balance(acc.uuid, EconomyConfig.DEFAULT_BALANCE, acc.name)
+        success, new_bal = economy.set_balance_checked(acc.uuid, EconomyConfig.DEFAULT_BALANCE, acc.name)
+        if not success:
+            send_message(sender, u"{prefix}&cСброс не выполнен. Баланс не изменён.")
+            return True
         send_message(sender, "eco_set", target=acc.name, formatted_balance=format_currency(new_bal))
         return True
 
@@ -1921,16 +2603,16 @@ def cmd_eco(*args):
         send_message(sender, "usage_eco")
         return True
 
-    try:
-        amount = float(cmd_args[2])
-        if amount < 0:
-            raise ValueError()
-    except ValueError:
+    amount = safe_amount(cmd_args[2], default=None)
+    if amount is None or amount < 0.0:
         send_message(sender, "invalid_amount")
         return True
 
     if sub in ["give", "add"]:
-        new_bal = economy.deposit(acc.uuid, amount, acc.name)
+        success, new_bal = economy.deposit_checked(acc.uuid, amount, acc.name)
+        if not success:
+            send_message(sender, u"{prefix}&cНачисление не выполнено. Баланс не изменён.")
+            return True
         log_transaction(u"DEPOSIT", sender_name if hasattr(sender, "getUniqueId") else u"CONSOLE",
                         acc.name, amount, reason=u"/eco give",
                         new_bal_to=new_bal)
@@ -1947,7 +2629,10 @@ def cmd_eco(*args):
         send_message(sender, "eco_take", formatted_amount=format_currency(amount), target=acc.name, formatted_balance=format_currency(new_bal))
     elif sub == "set":
         old_bal = economy.get_balance(acc.uuid)
-        new_bal = economy.set_balance(acc.uuid, amount, acc.name)
+        success, new_bal = economy.set_balance_checked(acc.uuid, amount, acc.name)
+        if not success:
+            send_message(sender, u"{prefix}&cУстановка не выполнена. Баланс не изменён.")
+            return True
         log_transaction(u"SET", sender_name if hasattr(sender, "getUniqueId") else u"CONSOLE",
                         acc.name, amount, reason=u"/eco set (was %.2f)" % old_bal,
                         new_bal_to=new_bal)
@@ -2190,8 +2875,11 @@ if BUKKIT_AVAILABLE:
             self.cmd_name = name
             self.executor = executor
             self.completer = completer
+            self.owner = EconomyManager()
 
         def execute(self, sender, commandLabel, args):
+            if self.owner is None or not self.owner.is_active():
+                return True
             try:
                 if self.executor:
                     return self.executor(sender, commandLabel, list(args))
@@ -2202,6 +2890,8 @@ if BUKKIT_AVAILABLE:
             return True
 
         def tabComplete(self, *args):
+            if self.owner is None or not self.owner.is_active():
+                return build_java_list([])
             if self.completer:
                 try:
                     res = self.completer(*args)
@@ -2225,7 +2915,7 @@ else:
 
 def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
     if not BUKKIT_AVAILABLE:
-        return
+        return False
     try:
         server = Bukkit.getServer()
         cmap = None
@@ -2255,7 +2945,7 @@ def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
                     except Exception:
                         curr_cls = curr_cls.getSuperclass()
 
-            if known_commands:
+            if known_commands is not None:
                 name = cmd_obj.getName().lower()
 
                 keys_to_remove = []
@@ -2287,15 +2977,18 @@ def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases=[]):
                     alias_cmd = PyBukkitCommand(a_str, cmd_obj.getDescription(), cmd_obj.getUsage(), [], cmd_obj.executor, cmd_obj.completer)
                     known_commands.put(a_str, alias_cmd)
                     known_commands.put(fallback_prefix + ":" + a_str, alias_cmd)
+                return True
 
     except Exception as e:
         log_error(u"Error force-registering Bukkit command: {0}".format(e))
+    return False
 
 
 registered_economy_commands = []   # (name, aliases) - для полного снятия при выгрузке,
                                     # т.к. эти команды внедрены напрямую в CommandMap в
                                     # обход command_manager PySpigot и PySpigot не может
                                     # их снять сам при /pyspigot unload.
+managed_economy_commands = []
 
 
 def force_unregister_bukkit_command(fallback_prefix, name, aliases):
@@ -2349,6 +3042,13 @@ def force_unregister_bukkit_command(fallback_prefix, name, aliases):
 
 
 def unregister_economy_commands():
+    if PYSPIGOT_MANAGERS_AVAILABLE:
+        for command_obj in list(managed_economy_commands):
+            try:
+                _pyspigot.command_manager().unregisterCommand(command_obj)
+            except Exception:
+                pass
+    del managed_economy_commands[:]
     for name, aliases in list(registered_economy_commands):
         force_unregister_bukkit_command("smarty-economy", name, aliases)
     del registered_economy_commands[:]
@@ -2360,6 +3060,7 @@ def unregister_economy_commands():
 
 
 def register_economy_commands():
+    unregister_economy_commands()
     commands_def = [
         ("bal", "Check balance", "/bal [player]", ["money", "balance"], cmd_balance, tab_balance),
         ("pay", "Pay money to a player", "/pay <player> <amount>", [], cmd_pay, tab_pay),
@@ -2373,11 +3074,21 @@ def register_economy_commands():
 
     for item in commands_def:
         name, desc, usage, aliases, handler, tab_handler = item[0], item[1], item[2], item[3], item[4], item[5]
+        # Direct Bukkit registration is deliberate. PySpigot 0.9.1 has several
+        # overloaded registerCommand signatures; Jython can select a wrong one
+        # without a useful error, leaving /bal and /hud unusable after reload.
+        force_unregister_bukkit_command("smarty-economy", name, aliases)
         cmd_obj = PyBukkitCommand(name, desc, usage, aliases, handler, tab_handler)
-        force_register_bukkit_command("smarty-economy", cmd_obj, aliases)
+        if not force_register_bukkit_command("smarty-economy", cmd_obj, aliases):
+            raise RuntimeError("could not register /{0} in Bukkit CommandMap".format(name))
         registered_economy_commands.append((name, aliases))
 
-    log_info(u"Commands force-registered in Bukkit CommandMap (/bal, /pay, /eco, /showbal, /hud, /afk, /payday, /baltop) with TabCompletion.")
+    try:
+        if BUKKIT_AVAILABLE and hasattr(Bukkit.getServer(), "syncCommands"):
+            Bukkit.getServer().syncCommands()
+    except Exception as e:
+        log_error(u"Could not synchronize economy commands: {0}".format(e))
+    log_info(u"Economy commands registered directly in Bukkit CommandMap with tab completion.")
 
 
 # -----------------------------------------------------------------------------
@@ -2385,56 +3096,114 @@ def register_economy_commands():
 # -----------------------------------------------------------------------------
 def on_enable():
     log_info(u"=== Starting {0} v{1} ===".format(EconomyConfig.PLUGIN_NAME, EconomyConfig.VERSION))
+    economy = None
     try:
         unregister_script_listeners()
         economy = EconomyManager()
+        if not economy._database_loaded:
+            raise RuntimeError("economy.json is damaged and no valid backup is available")
         log_info(u"Database loaded successfully ({0} accounts).".format(len(economy.accounts)))
 
         if JAVA_STRING_AVAILABLE and System is not None:
             try:
-                System.getProperties().put("PySpigot_EconomyManager", economy)
-                System.getProperties().put("SmartY_EconomyManager", economy)
+                props = System.getProperties()
+                previous = props.get("PySpigot_EconomyManager")
+                if previous is None:
+                    previous = props.get("SmartY_EconomyManager")
+                if previous is not None and previous is not economy and hasattr(previous, "deactivate"):
+                    previous.deactivate()
+                props.put("PySpigot_EconomyManager", economy)
+                props.put("SmartY_EconomyManager", economy)
             except Exception:
                 pass
+        economy._active = True
+        # Creates the first file when the database does not exist and upgrades
+        # the on-disk format only after this manager becomes authoritative.
+        if not economy.save_database():
+            raise RuntimeError("economy.json is not writable")
 
         if BUKKIT_AVAILABLE:
             capture_default_sleep_rules()
-            register_event_directly(PlayerJoinEvent, on_player_join)
-            register_event_directly(PlayerQuitEvent, on_player_quit)
-            register_event_directly(PlayerMoveEvent, on_player_move)
-            register_event_directly(PlayerInteractEvent, on_player_activity)
-            register_event_directly(PlayerCommandPreprocessEvent, on_player_command)
-            register_event_directly(AsyncPlayerChatEvent, on_player_activity)
+            required_events = [
+                (PlayerJoinEvent, on_player_join),
+                (PlayerQuitEvent, on_player_quit),
+                (PlayerMoveEvent, on_player_move),
+                (PlayerInteractEvent, on_player_activity),
+                (PlayerCommandPreprocessEvent, on_player_command),
+                (EntityDeathEvent, on_mob_death),
+            ]
+            if AsyncPlayerChatEvent is not None:
+                required_events.append((AsyncPlayerChatEvent, on_player_activity))
             if InventoryClickEvent is not None:
-                register_event_directly(InventoryClickEvent, on_player_activity)
-            log_info(u"Economy events registered directly into Bukkit EventMap.")
+                required_events.append((InventoryClickEvent, on_player_activity))
+            for event_class, event_handler in required_events:
+                if not register_event_directly(event_class, event_handler):
+                    raise RuntimeError("could not register event {0}".format(event_class))
+            log_info(u"Economy events registered through PySpigot listener manager.")
+            # При /ps reload игроки не получают новый PlayerJoinEvent. Фиксируем,
+            # что они уже онлайн, чтобы будущий рестарт не считал время от старого входа.
+            checkpoint_online_last_seen(time.time())
 
         register_economy_commands()
         reset_online_payday_checks()
-        start_payday_timer()
-        start_afk_timer()
-        start_hud_timer()
+        if not start_payday_timer():
+            raise RuntimeError("payday timer did not start")
+        if not start_afk_timer():
+            raise RuntimeError("AFK timer did not start")
+        if not start_hud_timer():
+            raise RuntimeError("HUD timer did not start")
         log_info(u"{0} successfully enabled and ready!".format(EconomyConfig.PLUGIN_NAME))
     except Exception as e:
         log_error(u"Critical error in economy on_enable: {0}".format(e))
+        stop_hud_timer()
+        stop_afk_timer()
+        stop_payday_timer()
+        unregister_script_listeners()
+        unregister_economy_commands()
+        if economy is not None:
+            try:
+                if JAVA_STRING_AVAILABLE and System is not None:
+                    props = System.getProperties()
+                    for key in ["PySpigot_EconomyManager", "SmartY_EconomyManager"]:
+                        if props.get(key) is economy:
+                            props.remove(key)
+                economy.deactivate()
+            except Exception:
+                pass
         import traceback
         traceback.print_exc()
 
 
 def on_disable():
     log_info(u"=== Disabling {0} ===".format(EconomyConfig.PLUGIN_NAME))
+    shutdown_timestamp = time.time()
     stop_hud_timer()
     stop_afk_timer()
     stop_payday_timer()
+    # На остановке сервера PlayerQuitEvent может не дойти до PySpigot-скрипта.
+    # Сохраняем всех, кого Bukkit ещё считает подключёнными, одним JSON-write.
+    try:
+        checkpoint_online_last_seen(shutdown_timestamp)
+    except Exception as e:
+        log_error(u"Error saving online last-seen values during shutdown: {0}".format(e))
     unregister_script_listeners()
     unregister_economy_commands()
     try:
         economy = EconomyManager()
         if BUKKIT_AVAILABLE:
-            now = time.time()
             for player in Bukkit.getOnlinePlayers():
-                process_player_payday(economy, player, now, False)
+                process_player_payday(economy, player, shutdown_timestamp, False, False)
         economy.save_database()
+    except Exception:
+        pass
+    try:
+        economy = EconomyManager()
+        if JAVA_STRING_AVAILABLE and System is not None:
+            props = System.getProperties()
+            for key in ["PySpigot_EconomyManager", "SmartY_EconomyManager"]:
+                if props.get(key) is economy:
+                    props.remove(key)
+        economy.deactivate()
     except Exception:
         pass
     restore_all_sleep_rules()
@@ -2445,12 +3214,8 @@ def start(script=None):
 
 
 def stop(script=None):
-    # ВАЖНО: PySpigot вызывает автоматически именно stop() (не on_disable()) при
-    # /pyspigot unload <script>. Без этой функции on_disable() никогда не выполнялся бы
-    # при ручной выгрузке скрипта - таймеры (payday/afk/hud), напрямую (в обход
-    # command_manager) зарегистрированные команды /bal /pay /eco /showbal /hud /afk
-    # /payday /baltop и listeners, добавленные через registerEvent в обход
-    # listener_manager, продолжали бы работать даже после выгрузки скрипта.
+    # PySpigot calls stop() during /pyspigot unload. Managed commands,
+    # listeners and tasks are also owned by PySpigot as a second cleanup layer.
     on_disable()
 
 
