@@ -20,19 +20,21 @@ import pyspigot as ps
 import os
 import json
 import codecs
+import math
 
 cmd_mgr      = ps.command_manager()
 listener_mgr = ps.listener_manager()
 scheduler    = ps.scheduler
 
-from java.lang import System, Byte as JByte, Long as JLong
-from java.util import UUID as JUUID, ArrayList, HashMap
+from java.lang import System, Byte as JByte, Long as JLong, Integer as JInteger
+from java.util import UUID as JUUID, ArrayList, HashMap, Base64
+from org.joml import Vector3f, Quaternionf
 
 from org.bukkit import (
-    Bukkit, Material, Particle, Sound, NamespacedKey, Registry, Color
+    Bukkit, Material, Particle, Sound, NamespacedKey, Registry, Color, ChatColor
 )
 from org.bukkit.entity import (
-    Player, LivingEntity, Arrow, AbstractArrow
+    Player, LivingEntity, Arrow, AbstractArrow, BlockDisplay
 )
 from org.bukkit.event.player import (
     PlayerInteractEvent, PlayerDropItemEvent, PlayerRespawnEvent,
@@ -46,10 +48,10 @@ from org.bukkit.event.inventory import InventoryClickEvent, InventoryCloseEvent
 from org.bukkit.event.block import Action
 from org.bukkit.enchantments import Enchantment
 from org.bukkit.inventory import ItemStack, EquipmentSlot
-from org.bukkit.inventory.meta import LeatherArmorMeta
+from org.bukkit.inventory.meta import LeatherArmorMeta, Damageable as ItemDamageable
 from org.bukkit.potion import PotionEffect
 from org.bukkit.persistence import PersistentDataType
-from org.bukkit.util import Vector
+from org.bukkit.util import Vector, Transformation
 
 # DamageSource (Paper 1.20.5+)
 _HAS_DAMAGE_API = True
@@ -72,6 +74,7 @@ KEY_TIER       = NamespacedKey.fromString("archer:tier")       # int
 KEY_OWNER      = NamespacedKey.fromString("archer:owner")      # uuid
 KEY_ARROW      = NamespacedKey.fromString("archer:arrow")      # флаг взрывной стрелы
 KEY_MIRROR_EXP = NamespacedKey.fromString("archer:mirror_expire")  # long ms
+KEY_ULT_DISPLAY = NamespacedKey.fromString("archer:ult_display")
 
 # Клинок: тир → damage HP
 SWORD_DAMAGE = {1: 6.0, 2: 7.6, 3: 13.8}   # в HP (уже в единицах жизни)
@@ -96,6 +99,7 @@ ASTRAL_CD   = 2 * 60 * 20
 ULT_DUR         = 20 * 20
 ULT_CD          = 5 * 60 * 20
 ULT_RADIUS      = 10.0
+ULT_CAPTURE_RADIUS = 16.0
 ULT_TICK_DMG    = 1.0             # ребаланс: 0.5 сердца = 1 HP
 ULT_TICK_PERIOD = 20              # раз в секунду (было 10 тиков)
 
@@ -114,7 +118,8 @@ BOW3_ARMOR_PIERCE = 4.0       # 2 сердца пробойного
 # Формат записи (HashMap):
 #     "name":    unicode  — русское название для поиска (без цвет-кодов)
 #     "display": unicode  — красивое имя для чата/GUI
-#     "factory": callable(owner_uuid) -> ItemStack (I тир, без спец-механик
+#     "factory": callable(owner_uuid) -> ItemStack (предпоследний тир, без
+#                                                    спец-механик
 #                                                    оригинальных легендарных свойств
 #                                                    — фабрике не обязательно чистить
 #                                                    PDC/атрибуты, это делает Арчер)
@@ -211,7 +216,7 @@ def _mirror_lore(extra_line=u""):
     lore = [
         u"§7Отражение особого предмета,",
         u"§7созданное Зеркалом Души.",
-        u"§8Тир: §fI §8(минимальный)",
+        u"§8Тир оригинала: §fпредпоследний",
         u"§8Прочность: §f100§8. Живёт §f3 §8минуты.",
         u"",
         u"§8Без уникальных способностей и пассивок.",
@@ -224,33 +229,13 @@ def _mirror_lore(extra_line=u""):
 # --- Фабрики копий ---------------------------------------------------------
 
 def _fac_archer_kanshou(owner):
-    # Каншо I — каменный меч + Sharpness II (как в оригинале I тира).
-    it = ItemStack(Material.STONE_SWORD, 1)
-    m = it.getItemMeta()
-    m.setDisplayName(u"§cКаншо")
-    if ENC_SHARP is not None:
-        m.addEnchant(ENC_SHARP, 2, True)
-    it.setItemMeta(m)
-    return it
+    return create_sword("kanshou", 2, owner)
 
 def _fac_archer_bakuya(owner):
-    it = ItemStack(Material.STONE_SWORD, 1)
-    m = it.getItemMeta()
-    m.setDisplayName(u"§bБакуя")
-    if ENC_SHARP is not None:
-        m.addEnchant(ENC_SHARP, 2, True)
-    it.setItemMeta(m)
-    return it
+    return create_sword("bakuya", 2, owner)
 
 def _fac_archer_bow(owner):
-    # Каладболг I — обычный лук + Power I.
-    it = ItemStack(Material.BOW, 1)
-    m = it.getItemMeta()
-    m.setDisplayName(u"§6Каладболг")
-    if ENC_POWER is not None:
-        m.addEnchant(ENC_POWER, 1, True)
-    it.setItemMeta(m)
-    return it
+    return create_bow(2, owner)
 
 
 # --- API поверх глобального каталога -------------------------------------
@@ -305,9 +290,11 @@ def _entry_name(entry_id):
 
 DATA_DIR   = os.path.join("plugins", "PySpigot", "scripts", "data")
 DATA_FILE  = os.path.join(DATA_DIR, "archer_mirror.json")
+CUSTOM_DATA_FILE = os.path.join(DATA_DIR, "archer_mirror_custom.json")
 
 # uid_of_archer -> set of canonical keys
 learned = {}
+custom_templates = {}   # archer uuid -> normalized name -> {display, item(base64)}
 
 def _ensure_dir():
     try:
@@ -342,7 +329,7 @@ def save_learned():
         f = codecs.open(DATA_FILE, "w", "utf-8")
         # Конвертируем set → list для JSON
         d = {u: sorted(list(s)) for u, s in learned.items()}
-        f.write(json.dumps(d, ensure_ascii=False, indent=2))
+        f.write(json.dumps(d, ensure_ascii=True, indent=2))
         f.close()
     except Exception as ex:
         Bukkit.getLogger().warning("[archer] learned save: " + str(ex))
@@ -375,6 +362,113 @@ def known_entry_ids(archer):
         if n in known_names:
             result.append(entry_id)
     return result
+
+def load_custom_templates():
+    global custom_templates
+    _ensure_dir()
+    if not os.path.exists(CUSTOM_DATA_FILE):
+        custom_templates = {}
+        return
+    try:
+        f = codecs.open(CUSTOM_DATA_FILE, "r", "utf-8")
+        try: custom_templates = json.loads(f.read())
+        finally: f.close()
+        if not isinstance(custom_templates, dict): custom_templates = {}
+    except Exception as ex:
+        custom_templates = {}
+        Bukkit.getLogger().warning("[archer] custom mirror load: " + str(ex))
+
+def save_custom_templates():
+    _ensure_dir()
+    try:
+        tmp = CUSTOM_DATA_FILE + ".tmp"
+        f = codecs.open(tmp, "w", "utf-8")
+        try: f.write(json.dumps(custom_templates, ensure_ascii=True, indent=2))
+        finally: f.close()
+        if os.path.exists(CUSTOM_DATA_FILE): os.remove(CUSTOM_DATA_FILE)
+        os.rename(tmp, CUSTOM_DATA_FILE)
+    except Exception as ex:
+        Bukkit.getLogger().warning("[archer] custom mirror save: " + str(ex))
+
+def _item_to_b64(item):
+    try: return str(Base64.getEncoder().encodeToString(item.serializeAsBytes()))
+    except Exception: return None
+
+def _item_from_b64(raw):
+    try: return ItemStack.deserializeBytes(Base64.getDecoder().decode(str(raw)))
+    except Exception: return None
+
+PENULTIMATE_TIER = {
+    "amonra":2, "architect":2, "archer":2, "barsik":4, "doomlord":2,
+    "dragon":2, "griblet":2, "kris":4, "mihawk":4, "poseidon":2,
+    "shanks":5, "steelgorn":2, "warden":2,
+}
+
+def _character_tier(item):
+    meta = item.getItemMeta()
+    if meta is None: return None, None
+    pdc = meta.getPersistentDataContainer()
+    try:
+        for key in pdc.getKeys():
+            if key.getKey() != "tier": continue
+            try:
+                value = pdc.get(key, PersistentDataType.INTEGER)
+                if value is not None: return key.getNamespace(), int(value)
+            except Exception: pass
+    except Exception: pass
+    return None, None
+
+def save_held_template(player, requested_name=None):
+    item = player.getInventory().getItemInMainHand()
+    if item is None or item.getType() == Material.AIR:
+        player.sendMessage(u"§cВозьми сохраняемый предмет в основную руку.")
+        return False
+    if item.getType() not in MIRROR_ALLOWED:
+        player.sendMessage(u"§cЗеркало сохраняет только оружие, инструменты, щиты и удочки.")
+        return False
+    namespace, tier = _character_tier(item)
+    if namespace is not None:
+        allowed_tier = PENULTIMATE_TIER.get(namespace)
+        if allowed_tier is None or tier != allowed_tier:
+            player.sendMessage(u"§cКастомный предмет можно сохранить только на предпоследнем тире.")
+            return False
+    meta = item.getItemMeta()
+    if requested_name:
+        display = _to_unicode(requested_name).strip()
+    elif meta is not None and meta.hasDisplayName():
+        display = _to_unicode(ChatColor.stripColor(meta.getDisplayName()))
+    else:
+        display = _to_unicode(item.getType().name().replace("_", " ").title())
+    name = _norm(display)
+    if not name:
+        player.sendMessage(u"§cНе удалось определить название предмета.")
+        return False
+    encoded = _item_to_b64(item.clone())
+    if encoded is None:
+        player.sendMessage(u"§cЭту вещь невозможно сохранить.")
+        return False
+    custom_templates.setdefault(uid(player), {})[name] = {"display": display, "item": encoded}
+    save_custom_templates()
+    player.sendMessage(u"§d§l✦ Зеркало запомнило предмет: §f" + display)
+    return True
+
+def remove_mirror_template(player, query):
+    name = _norm(query)
+    own = custom_templates.setdefault(uid(player), {})
+    if name in own:
+        own.pop(name, None); save_custom_templates()
+        player.sendMessage(u"§aПредмет удалён из Зеркала: §f" + _to_unicode(query))
+        return True
+    # Особый предмет каталога хранится в learned по нормализованному имени.
+    learned_set = learned.setdefault(uid(player), set())
+    entry_id = _find_special_key(query)
+    learned_name = _norm(_entry_name(entry_id)) if entry_id is not None else name
+    if learned_name in learned_set:
+        learned_set.discard(learned_name); save_learned()
+        player.sendMessage(u"§aПредмет удалён из Зеркала: §f" + _to_unicode(query))
+        return True
+    player.sendMessage(u"§cТакого предмета нет в вашем Зеркале.")
+    return False
 
 
 # --- Отражения-запросы (Дар отражения) ------------------------------------
@@ -477,6 +571,7 @@ mirror_ttl     = {}   # (owner_uid, marker_pdc) — не используетс�
 
 astral_active  = {}   # uid -> end_tick
 ult_active     = {}   # uid -> end_tick
+ult_domain_displays = []
 
 master_of      = {}   # servant_uid -> master_uid (у Арчера сейчас Мастер)
 seals_left     = {}   # master_uid -> int (командные заклинания)
@@ -514,7 +609,7 @@ def is_silenced_by_demiurg(p):
     except Exception:
         return False
 
-def add_effect(e, pt, ticks, amp, ambient=False, particles=True):
+def add_effect(e, pt, ticks, amp, ambient=False, particles=False):
     if pt is None: return
     e.addPotionEffect(PotionEffect(pt, ticks, amp, ambient, particles, True))
 
@@ -602,11 +697,16 @@ def find_sword_anywhere(p, kind):
 # =============================================================================
 
 def _set_max_dur(meta, dur):
-    """Ставит максимальную прочность через Paper 1.20.5+ API."""
+    """Ставит новую максимальную прочность и полностью чинит предмет."""
     try:
-        meta.setMaxDamage(dur)
-    except Exception:
-        pass
+        if isinstance(meta, ItemDamageable):
+            meta.setMaxDamage(JInteger(int(dur)))
+            try: meta.resetDamage()
+            except Exception: meta.setDamage(0)
+            return True
+    except Exception as ex:
+        Bukkit.getLogger().warning("[archer] max durability: " + str(ex))
+    return False
 
 def create_sword(kind, tier, owner):
     """kind = 'kanshou' (Небесная кара) | 'bakuya' (Бич членистоногих)."""
@@ -746,9 +846,7 @@ def _sanitize_mirror(item, display_override, owner_uuid):
 
 
 def create_mirror_from_key(entry_id, owner_uuid):
-    """Создаёт I-тир копию особого предмета по ID записи в глобальном каталоге.
-       Фабрика чужого скрипта возвращает "чистый предмет I тира", Арчер поверх
-       очищает всё лишнее и ставит свои маркеры (TTL, kind=mirror, owner)."""
+    """Создаёт копию предпоследнего тира по ID глобального каталога."""
     entry = _get_entry(entry_id)
     if entry is None:
         return None
@@ -765,6 +863,15 @@ def create_mirror_from_key(entry_id, owner_uuid):
     display = _to_unicode(entry.get("display"))
     if display:
         display = u"§d§lКопия §r" + display
+    return _sanitize_mirror(raw, display, owner_uuid)
+
+def create_mirror_from_custom(custom_key, owner_uuid):
+    name = _norm(custom_key[len("custom:"):]) if custom_key.startswith("custom:") else _norm(custom_key)
+    entry = custom_templates.get(owner_uuid, {}).get(name)
+    if not isinstance(entry, dict): return None
+    raw = _item_from_b64(entry.get("item"))
+    if raw is None: return None
+    display = u"§d§lКопия §r" + _to_unicode(entry.get("display", name))
     return _sanitize_mirror(raw, display, owner_uuid)
 
 
@@ -964,6 +1071,8 @@ def _mirror_slots_used(player):
 def open_mirror_gui_for(player):
     """Показывает окно 3×9: изученные предметы + инструкции."""
     known_ids = known_entry_ids(player)
+    custom_names = sorted(custom_templates.get(uid(player), {}).keys())
+    item_keys = list(known_ids) + ["custom:" + n for n in custom_names]
     size = 27  # 3 ряда
     inv = Bukkit.createInventory(None, size, u"§d§l⌘ Зеркало Души ⌘")
 
@@ -975,7 +1084,7 @@ def open_mirror_gui_for(player):
         it.setItemMeta(m)
         return it
 
-    if not known_ids:
+    if not item_keys:
         empty = _make_info(Material.GRAY_STAINED_GLASS_PANE,
                            u"§7Зеркало ещё пусто",
                            [u"§8Изучи предмет: §f/archer зеркало <название>",
@@ -984,14 +1093,23 @@ def open_mirror_gui_for(player):
     else:
         slots = list(range(0, 21))
         i = 0
-        for entry_id in known_ids:
+        for entry_id in item_keys:
             if i >= len(slots): break
-            entry = _get_entry(entry_id)
-            if entry is None: continue
             try:
                 # Иконка = чистая копия из фабрики + Арчер-санитайзинг,
                 # но без TTL (чтобы GUI-иконку не съел expiry-тикер).
-                icon = create_mirror_from_key(entry_id, uid(player))
+                if entry_id.startswith("custom:"):
+                    custom_name = _norm(entry_id[len("custom:"):])
+                    entry = custom_templates.get(uid(player), {}).get(custom_name)
+                    icon = create_mirror_from_custom(entry_id, uid(player))
+                    entry_display = _to_unicode(entry.get("display", custom_name)) if entry else custom_name
+                    tier_text = u"сохранённый экземпляр"
+                else:
+                    entry = _get_entry(entry_id)
+                    if entry is None: continue
+                    icon = create_mirror_from_key(entry_id, uid(player))
+                    entry_display = _to_unicode(entry.get("display"))
+                    tier_text = u"предпоследний тир"
                 if icon is None:
                     continue
                 mm = icon.getItemMeta()
@@ -1003,9 +1121,9 @@ def open_mirror_gui_for(player):
                 pdc.set(NamespacedKey.fromString("archer:gui_key"),
                         PersistentDataType.STRING, _to_unicode(entry_id))
                 mm.setLore(java_list([
-                    u"§7" + _to_unicode(entry.get("display")),
+                    u"§7" + entry_display,
                     u"",
-                    u"§eЛКМ §7— создать копию (I тир)",
+                    u"§eЛКМ §7— создать копию (" + tier_text + u")",
                 ]))
                 icon.setItemMeta(mm)
             except Exception:
@@ -1044,7 +1162,10 @@ def _spawn_mirror_from_gui(player, key):
                                (MIRROR_SLOTS, secs))
             return
 
-    copy = create_mirror_from_key(key, uid(player))
+    if _to_unicode(key).startswith(u"custom:"):
+        copy = create_mirror_from_custom(_to_unicode(key), uid(player))
+    else:
+        copy = create_mirror_from_key(key, uid(player))
     if copy is None:
         player.sendMessage(u"§cНе удалось создать копию.")
         return
@@ -1065,7 +1186,12 @@ def _spawn_mirror_from_gui(player, key):
                                     40, 0.5, 0.8, 0.5, 0.6)
     player.getWorld().playSound(player.getLocation(), Sound.BLOCK_ENCHANTMENT_TABLE_USE, 0.9, 1.3)
 
-    player.sendMessage(u"§d§l✦ Копия отражена: §r" + _entry_display(key))
+    if _to_unicode(key).startswith(u"custom:"):
+        custom_name = _norm(_to_unicode(key)[len(u"custom:"):])
+        display = _to_unicode(custom_templates.get(uid(player), {}).get(custom_name, {}).get("display", custom_name))
+    else:
+        display = _entry_display(key)
+    player.sendMessage(u"§d§l✦ Копия отражена: §r" + display)
 
 
 def ability_mirror(player, args=None):
@@ -1151,6 +1277,56 @@ def ability_astral(player):
 #  ABILITY 3 — УЛЬТИМЕЙТ
 # =============================================================================
 
+def _spawn_reality_marble(world, center):
+    """Строит лёгкую BlockDisplay-локацию без изменения блоков мира."""
+    displays = []
+    floor_y = center.getY() - 0.12
+    try:
+        # Девять крупных плит формируют отдельную арену 21x21.
+        for tx in (-7.0, 0.0, 7.0):
+            for tz in (-7.0, 0.0, 7.0):
+                loc = center.clone().add(tx - 3.5, -0.35, tz - 3.5)
+                loc.setYaw(0.0); loc.setPitch(0.0)
+                display = world.spawn(loc, BlockDisplay)
+                mat = Material.POLISHED_BLACKSTONE if (int(tx + tz) // 7) % 2 == 0 else Material.NETHERRACK
+                display.setBlock(Bukkit.createBlockData(mat))
+                display.getPersistentDataContainer().set(KEY_ULT_DISPLAY, PersistentDataType.BYTE, JByte(1))
+                display.setTransformation(Transformation(Vector3f(0.0, 0.0, 0.0), Quaternionf(),
+                                                         Vector3f(7.0, 0.25, 7.0), Quaternionf()))
+                displays.append(display)
+        # Клинки-столбы показывают границу зоны постоянного урона.
+        for i in range(16):
+            angle = 2.0 * math.pi * i / 16.0
+            loc = center.clone().add(math.cos(angle) * ULT_RADIUS, 0.0, math.sin(angle) * ULT_RADIUS)
+            loc.setYaw(0.0); loc.setPitch(0.0)
+            display = world.spawn(loc, BlockDisplay)
+            display.setBlock(Bukkit.createBlockData(Material.IRON_BLOCK))
+            display.getPersistentDataContainer().set(KEY_ULT_DISPLAY, PersistentDataType.BYTE, JByte(1))
+            display.setTransformation(Transformation(Vector3f(-0.18, 0.0, -0.18), Quaternionf(),
+                                                     Vector3f(0.36, 3.5, 0.36), Quaternionf()))
+            displays.append(display)
+    except Exception as ex:
+        Bukkit.getLogger().warning("[archer] reality marble build: " + str(ex))
+    ult_domain_displays.extend(displays)
+    return displays
+
+def _remove_reality_marble(displays):
+    for display in displays:
+        try:
+            if display is not None and display.isValid(): display.remove()
+        except Exception: pass
+        try: ult_domain_displays.remove(display)
+        except Exception: pass
+
+def _cleanup_stale_reality_marble():
+    try:
+        for world in Bukkit.getWorlds():
+            for entity in world.getEntitiesByClass(BlockDisplay):
+                if entity.getPersistentDataContainer().has(KEY_ULT_DISPLAY, PersistentDataType.BYTE):
+                    entity.remove()
+    except Exception as ex:
+        Bukkit.getLogger().warning("[archer] stale reality marble cleanup: " + str(ex))
+
 def ability_ult(player):
     if not check_cd(player, "ult", u"«Мрамор реальности»"):
         return
@@ -1159,11 +1335,22 @@ def ability_ult(player):
     world = player.getWorld()
     center = player.getLocation().clone()   # копия — не двигается за игроком
 
-    # Собираем "перенесённых" — всех живых в радиусе кроме Арчера.
+    # Собираем переносимых из более широкой зоны, затем помещаем внутрь арены.
     trapped = []
-    for e in world.getNearbyEntities(center, ULT_RADIUS, ULT_RADIUS, ULT_RADIUS):
+    for e in world.getNearbyEntities(center, ULT_CAPTURE_RADIUS, ULT_CAPTURE_RADIUS, ULT_CAPTURE_RADIUS):
         if isinstance(e, LivingEntity) and not e.equals(player):
             trapped.append(e)
+
+    domain_displays = _spawn_reality_marble(world, center)
+    try: player.teleport(center.clone().add(0.0, 0.2, 0.0))
+    except Exception: pass
+    for index, target in enumerate(trapped):
+        try:
+            angle = 2.0 * math.pi * index / float(max(1, len(trapped)))
+            radius = 3.0 + float(index % 3)
+            destination = center.clone().add(math.cos(angle) * radius, 0.25, math.sin(angle) * radius)
+            target.teleport(destination)
+        except Exception: pass
 
     # Визуал активации — эпично.
     world.spawnParticle(Particle.LARGE_SMOKE, center, 80, 5.0, 3.0, 5.0, 0.05)
@@ -1217,6 +1404,7 @@ def ability_ult(player):
         # Финал.
         if now_tick() >= end:
             ult_active.pop(uid(player), None)
+            _remove_reality_marble(domain_displays)
             if player.isOnline():
                 add_effect(player, E_WEAKNESS, 60 * 20, 0)
                 add_effect(player, E_HUNGER,   60 * 20, 0)
@@ -1239,8 +1427,13 @@ def ability_ult(player):
                 bar.setTitle(u"§4§lМрамор Реальности §7— %.1f сек" % (remaining_ticks / 20.0))
             except Exception: pass
 
-        # Проходим по захваченным.
-        for t in trapped:
+        # Урон принадлежит самой фиксированной локации: получает любой, кто
+        # сейчас находится внутри, даже если он вошёл после активации.
+        current_targets = []
+        for entity in world.getNearbyEntities(center, ULT_RADIUS, ULT_RADIUS, ULT_RADIUS):
+            if isinstance(entity, LivingEntity) and not entity.equals(player):
+                current_targets.append(entity)
+        for t in current_targets:
             if t is None or t.isDead() or not t.isValid(): continue
             try:
                 d2 = t.getLocation().distanceSquared(center)
@@ -1267,7 +1460,6 @@ def ability_ult(player):
                         t.sendMessage(u"§a✓ Ты вырвался из Мрамора Реальности.")
                     except Exception: pass
                 elif not isinstance(t, Player):
-                    # Мобов тянем обратно.
                     try: t.teleport(center)
                     except Exception: pass
 
@@ -1558,6 +1750,8 @@ def cmd_archer(sender, label, args):
     if len(args) == 0:
         sender.sendMessage(u"§7Использование:")
         sender.sendMessage(u"  §f/archer <зеркало|астрал|ульт>")
+        sender.sendMessage(u"  §f/archer зеркало сохранить [название] §8— предмет из руки")
+        sender.sendMessage(u"  §f/archer зеркало удалить <название>")
         sender.sendMessage(u"  §f/archer bowtier <1..3> §8— админ-апгрейд лука")
         sender.sendMessage(u"  §f/archer master <ник|clear> §8— назначить Мастера")
         sender.sendMessage(u"  §f/archer seal §8— расход командного заклинания (для Мастера)")
@@ -1572,6 +1766,18 @@ def cmd_archer(sender, label, args):
         # /archer зеркало           — открыть GUI
         # /archer зеркало <название> — изучить
         rest = list(args[1:])
+        if rest:
+            mirror_action = _norm(rest[0])
+            if mirror_action in (u"сохранить", u"save"):
+                custom_name = u" ".join([_to_unicode(x) for x in rest[1:]]).strip() if len(rest) > 1 else None
+                save_held_template(sender, custom_name)
+                return True
+            if mirror_action in (u"удалить", u"remove", u"delete"):
+                if len(rest) < 2:
+                    sender.sendMessage(u"§7Использование: §f/archer зеркало удалить <название>")
+                    return True
+                remove_mirror_template(sender, u" ".join([_to_unicode(x) for x in rest[1:]]))
+                return True
         ability_mirror(sender, rest)
         return True
 
@@ -1815,6 +2021,8 @@ listener_mgr.registerListener(on_inv_click,    InventoryClickEvent)
 listener_mgr.registerListener(on_inv_close,    InventoryCloseEvent)
 
 load_learned()
+load_custom_templates()
+_cleanup_stale_reality_marble()
 _passives_tick()
 _mirror_expiry_tick()
 
@@ -1884,5 +2092,9 @@ try:
     System.getProperties().put("quest_tracker.stat.archer", _archer_stat)
 except Exception: pass
 
+def stop(script=None):
+    _remove_reality_marble(list(ult_domain_displays))
+    save_learned()
+    save_custom_templates()
 
 Bukkit.getLogger().info("[archer] Archer loaded. Commands: /test archer, /archer, /archerseal")

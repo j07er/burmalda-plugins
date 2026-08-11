@@ -26,6 +26,9 @@ import os
 import io
 import json
 import time
+import shutil
+import threading
+import uuid
 
 import pyspigot as ps
 from java.lang import System, Byte as JByte, Long as JLong
@@ -36,7 +39,7 @@ from org.bukkit.block import Chest, Barrel, BlockFace
 from org.bukkit.entity import Player
 from org.bukkit.command import Command, TabCompleter
 from org.bukkit.event.block import BlockBreakEvent, BlockPlaceEvent
-from org.bukkit.event.player import PlayerInteractEvent, AsyncPlayerChatEvent, PlayerQuitEvent
+from org.bukkit.event.player import PlayerInteractEvent, AsyncPlayerChatEvent, PlayerQuitEvent, PlayerJoinEvent
 from org.bukkit.event.inventory import InventoryClickEvent, InventoryDragEvent, InventoryCloseEvent
 from org.bukkit.inventory import ItemStack
 from org.bukkit.persistence import PersistentDataType
@@ -76,8 +79,17 @@ ADMIN_NAMES = set([u"blueredtronce"])
 #   }
 # }
 state = {
-    "shops": {}
+    "shops": {},
+    "transactions": {},
+    "sales_history": [],
+    "notifications": {},
+    "next_transaction_id": 1
 }
+trade_lock = threading.RLock()
+HISTORY_LIMIT = 2000
+NOTIFICATION_LIMIT = 100
+EMPTY_WARNING_COOLDOWN = 6 * 60 * 60
+DEFAULT_TRADE_TAX_PERCENT = 5.0
 
 # Ожидание ввода цены в чат: uuid_str -> { "world", "x", "y", "z", "item": ItemStack }
 pending_creations = {}
@@ -395,27 +407,160 @@ class EconomyHelper(object):
                 pass
         return 0.0
 
+    @staticmethod
+    def deposit_checked(uuid_str, amount, name=None):
+        mgr = EconomyHelper.get_manager()
+        if not mgr:
+            return False
+        try:
+            if hasattr(mgr, "deposit_checked"):
+                result = mgr.deposit_checked(uuid_str, float(amount), name if name else u"Unknown")
+                return bool(result[0] if isinstance(result, (tuple, list)) else result)
+            mgr.deposit(uuid_str, float(amount), name if name else u"Unknown")
+            return True
+        except Exception:
+            return False
+
+
+class TownHelper(object):
+    @staticmethod
+    def manager():
+        try:
+            return System.getProperties().get("SmartY_TownState")
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_city(uuid_str):
+        manager = TownHelper.manager()
+        if manager and hasattr(manager, "get_city_by_player"):
+            try:
+                return manager.get_city_by_player(str(uuid_str))
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def get_city_by_name(name):
+        manager = TownHelper.manager()
+        if name and manager and hasattr(manager, "get_city_by_name"):
+            try:
+                return manager.get_city_by_name(_to_unicode(name))
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def city_name(city):
+        if city is None:
+            return u""
+        try:
+            return _to_unicode(city.get("name"))
+        except Exception:
+            try:
+                return _to_unicode(city["name"])
+            except Exception:
+                return u""
+
+    @staticmethod
+    def tax_percent(city):
+        name = TownHelper.city_name(city)
+        manager = TownHelper.manager()
+        if name and manager and hasattr(manager, "get_company_tax_percent"):
+            try:
+                return max(0.0, min(100.0, float(manager.get_company_tax_percent(
+                    name, "tradehall", DEFAULT_TRADE_TAX_PERCENT))))
+            except Exception:
+                pass
+        return 0.0
+
+    @staticmethod
+    def add_tax(city, amount):
+        if amount <= 0:
+            return True
+        name = TownHelper.city_name(city)
+        manager = TownHelper.manager()
+        if not name or not manager or not hasattr(manager, "add_company_tax"):
+            return False
+        try:
+            result = manager.add_company_tax(name, float(amount))
+            return bool(result[0] if isinstance(result, (tuple, list)) else result)
+        except Exception:
+            return False
+
+
+def queue_notification(uuid_str, text):
+    queue = state.setdefault("notifications", {}).setdefault(str(uuid_str), [])
+    queue.append({"time": now_sec(), "text": _to_unicode(text)})
+    if len(queue) > NOTIFICATION_LIMIT:
+        del queue[:-NOTIFICATION_LIMIT]
+
+
+def notify_player(uuid_str, name, text):
+    try:
+        player = Bukkit.getPlayer(name)
+    except Exception:
+        player = None
+    if player and player.isOnline():
+        player.sendMessage(_to_unicode(text))
+    else:
+        queue_notification(uuid_str, text)
+
+
+def on_player_join(event):
+    player = event.getPlayer()
+    player_uuid = uid(player)
+    queued = list(state.setdefault("notifications", {}).get(player_uuid, []))
+    if queued:
+        state["notifications"].pop(player_uuid, None)
+        if not _save():
+            state["notifications"][player_uuid] = queued
+            player.sendMessage(u"§6§l[Трейдхолл] §cНе удалось подтвердить выдачу офлайн-уведомлений; они сохранены до следующего входа.")
+            return
+        player.sendMessage(u"§6§l[Трейдхолл] §eОфлайн-уведомления:")
+        for entry in queued:
+            player.sendMessage(_to_unicode(entry.get("text", u"")))
+
 # -------------------------------------------------------------------------
 # ЗАГРУЗКА И СОХРАНЕНИЕ БАЗЫ ДАННЫХ
 # -------------------------------------------------------------------------
 def _load():
     global state
     try:
-        if not os.path.exists(DATA_FILE):
-            state = {"shops": {}}
+        if not os.path.exists(DATA_FILE) and not os.path.exists(DATA_FILE + ".bak"):
+            state = {"shops": {}, "transactions": {}, "sales_history": [],
+                     "notifications": {}, "next_transaction_id": 1}
             return
-        f = io.open(DATA_FILE, "r", encoding="utf-8")
-        try:
-            raw = f.read()
-        finally:
-            f.close()
-        if raw.strip():
-            state = json.loads(raw)
-            if "shops" not in state:
-                state["shops"] = {}
+        loaded = None
+        for candidate in [DATA_FILE, DATA_FILE + ".bak"]:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                f = io.open(candidate, "r", encoding="utf-8")
+                try:
+                    raw = f.read()
+                finally:
+                    f.close()
+                if raw.strip():
+                    loaded = json.loads(raw)
+                    break
+            except Exception as ex:
+                Bukkit.getLogger().warning("[tradehall_shop] load candidate error: " + str(ex))
+        if loaded is None:
+            raise IOError("primary and backup tradehall storage are unreadable")
+        state = loaded
+        state.setdefault("shops", {})
+        state.setdefault("transactions", {})
+        state.setdefault("sales_history", [])
+        state.setdefault("notifications", {})
+        state.setdefault("next_transaction_id", 1)
+        for shop in state["shops"].values():
+            shop.setdefault("empty_warned_at", 0)
+            shop.setdefault("sales_count", 0)
+            shop.setdefault("sales_volume", 0.0)
     except Exception as ex:
         Bukkit.getLogger().warning("[tradehall_shop] load error: " + str(ex))
-        state = {"shops": {}}
+        raise
 
 def _save():
     try:
@@ -424,13 +569,33 @@ def _save():
         text = json.dumps(state, ensure_ascii=False, indent=2)
         if isinstance(text, str):
             text = text.decode("utf-8", "replace")
-        f = io.open(DATA_FILE, "w", encoding="utf-8")
+        temp_file = DATA_FILE + ".tmp"
+        if os.path.exists(DATA_FILE):
+            try:
+                shutil.copy2(DATA_FILE, DATA_FILE + ".bak")
+            except Exception:
+                pass
+        f = io.open(temp_file, "w", encoding="utf-8")
         try:
             f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
         finally:
             f.close()
+        try:
+            from java.nio.file import Files, Paths, StandardCopyOption
+            Files.move(Paths.get(temp_file), Paths.get(DATA_FILE), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        except Exception:
+            if os.path.exists(DATA_FILE):
+                os.remove(DATA_FILE)
+            os.rename(temp_file, DATA_FILE)
+        return True
     except Exception as ex:
         Bukkit.getLogger().warning("[tradehall_shop] save error: " + str(ex))
+        return False
 
 # -------------------------------------------------------------------------
 # РАБОТА С ИНВЕНТАРЁМ СУНДУКА
@@ -491,9 +656,22 @@ def add_items_to_chest(inv, sample_item, amount_to_add):
         return False
     if count_free_space_in_chest(inv, sample_item) < amount_to_add:
         return False
-    copy = sample_item.clone()
-    copy.setAmount(amount_to_add)
-    inv.addItem(copy)
+    # Bukkit does not guarantee that an over-sized ItemStack will be split on
+    # every inventory implementation. Add only legal stacks.
+    remaining = int(amount_to_add)
+    max_stack = max(1, int(sample_item.getMaxStackSize()))
+    inserted = 0
+    while remaining > 0:
+        copy = sample_item.clone()
+        batch = min(max_stack, remaining)
+        copy.setAmount(batch)
+        leftovers = inv.addItem(copy)
+        if leftovers and len(leftovers) > 0:
+            if inserted > 0:
+                remove_matching_items(inv, sample_item, inserted)
+            return False
+        inserted += batch
+        remaining -= batch
     return True
 
 # -------------------------------------------------------------------------
@@ -724,126 +902,172 @@ def on_inventory_close(event):
         open_guis.pop(uid(who), None)
 
 # -------------------------------------------------------------------------
-# ВЫПОЛНЕНИЕ СДЕЛКИ (ПОКУПКА / ПРОДАЖА)
-# -------------------------------------------------------------------------
-def execute_trade(buyer_or_seller, shop, param):
-    mode = shop.get("mode", "SELL")
-    sample_item = yaml_to_item(shop.get("item_yaml"))
-    if not sample_item:
-        return
-    price = float(shop.get("price_per_item", 100.0))
-    inv_chest = get_shop_chest_inventory(shop)
-    if not inv_chest:
-        buyer_or_seller.sendMessage(u"§c✗ §7Сундук лавки не найден!")
-        return
-
-    owner_uuid = shop.get("owner_uuid")
-    owner_name = shop.get("owner_name", u"Владелец")
-    u_player = uid(buyer_or_seller)
-
-    if u_player == owner_uuid:
-        buyer_or_seller.sendMessage(u"§c✗ §7Вы не можете торговать в собственной лавке! (Для открытия сундука нажмите Shift+ПКМ)")
-        return
-
-    # РЕЖИМ ПРОДАЖИ (SELL)
-    if mode == "SELL":
-        in_stock = count_items_in_chest(inv_chest, sample_item)
-        if in_stock <= 0:
-            buyer_or_seller.sendMessage(u"§c✗ §7В этом сундуке закончился товар!")
-            buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_VILLAGER_NO, 1.0, 1.0)
-            return
-
-        if param == u"all":
-            my_money = EconomyHelper.get_balance(u_player)
-            max_can_afford = int(my_money // price)
-            qty = min(in_stock, max_can_afford)
-        else:
-            qty = int(param)
-
-        if qty <= 0:
-            buyer_or_seller.sendMessage(u"§c✗ §7У вас недостаточно монет для покупки!")
-            buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_VILLAGER_NO, 1.0, 1.0)
-            return
-
-        if qty > in_stock:
-            buyer_or_seller.sendMessage(u"§c✗ §7В сундуке осталось только §e%d шт. §7товара!" % in_stock)
-            return
-
-        total_price = qty * price
-        if not EconomyHelper.withdraw(u_player, total_price):
-            buyer_or_seller.sendMessage(u"§c✗ §7У вас недостаточно монет (нужно: §e%s§7)!" % format_currency(total_price))
-            buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_VILLAGER_NO, 1.0, 1.0)
-            return
-
-        EconomyHelper.deposit(owner_uuid, total_price, owner_name)
-
-        remove_items_from_chest(inv_chest, sample_item, qty)
-        copy = sample_item.clone()
-        copy.setAmount(qty)
-        buyer_or_seller.getInventory().addItem(copy)
-
-        buyer_or_seller.sendMessage(u"§a✓ §7Вы купили §f%d шт. %s §7за §e%s§7!" % (qty, get_item_display_name(sample_item), format_currency(total_price)))
-        buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0, 1.2)
-        _save()
-        open_shop_gui(buyer_or_seller, get_block_key(inv_chest.getLocation().getBlock()))
-
-    # РЕЖИМ СКУПКИ (BUY)
-    else:
-        inv_player = buyer_or_seller.getInventory()
-        player_has = count_items_in_chest(inv_player, sample_item)
-        if player_has <= 0:
-            buyer_or_seller.sendMessage(u"§c✗ §7У вас в инвентаре нет: §f%s§7!" % get_item_display_name(sample_item))
-            buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_VILLAGER_NO, 1.0, 1.0)
-            return
-
-        free_space = count_free_space_in_chest(inv_chest, sample_item)
-        if free_space <= 0:
-            buyer_or_seller.sendMessage(u"§c✗ §7В этом сундуке закончилось свободное место для скупки!")
-            return
-
-        owner_money = EconomyHelper.get_balance(owner_uuid)
-        max_owner_can_buy = int(owner_money // price)
-        if max_owner_can_buy <= 0:
-            buyer_or_seller.sendMessage(u"§c✗ §7У скупщика закончились монеты на балансе!")
-            return
-
-        if param == u"all":
-            qty = min(player_has, free_space, max_owner_can_buy)
-        else:
-            qty = int(param)
-
-        if qty <= 0:
-            buyer_or_seller.sendMessage(u"§c✗ §7Невозможно совершить сделку (проверьте наличие товара или деньги скупщика).")
-            return
-
-        if qty > player_has:
-            buyer_or_seller.sendMessage(u"§c✗ §7У вас в инвентаре только §e%d шт.§7!" % player_has)
-            return
-        if qty > free_space:
-            buyer_or_seller.sendMessage(u"§c✗ §7В сундуке осталось место только для §e%d шт.§7!" % free_space)
-            return
-        if qty > max_owner_can_buy:
-            buyer_or_seller.sendMessage(u"§c✗ §7Денег скупщика хватит только на §e%d шт.§7!" % max_owner_can_buy)
-            return
-
-        total_price = qty * price
-        if not EconomyHelper.withdraw(owner_uuid, total_price):
-            buyer_or_seller.sendMessage(u"§c✗ §7У скупщика недостаточно денег на счёте!")
-            return
-
-        EconomyHelper.deposit(u_player, total_price, buyer_or_seller.getName())
-
-        remove_items_from_chest(inv_player, sample_item, qty)
-        add_items_to_chest(inv_chest, sample_item, qty)
-
-        buyer_or_seller.sendMessage(u"§a✓ §7Вы продали §f%d шт. %s §7за §e%s§7!" % (qty, get_item_display_name(sample_item), format_currency(total_price)))
-        buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0, 1.2)
-        _save()
-        open_shop_gui(buyer_or_seller, get_block_key(inv_chest.getLocation().getBlock()))
-
-# -------------------------------------------------------------------------
 # СОЗДАНИЕ И ВЗАИМОДЕЙСТВИЕ С СУНДУКОМ / ТАБЛИЧКОЙ (PLAYER INTERACT EVENT)
 # -------------------------------------------------------------------------
+def _transaction_update(tx, status, error=None):
+    tx["status"] = status
+    tx["updated_at"] = now_sec()
+    if error:
+        tx["error"] = _to_unicode(error)
+    _save()
+
+
+def _archive_sale(tx, shop):
+    record = dict(tx)
+    record.pop("error", None)
+    state.setdefault("sales_history", []).append(record)
+    if len(state["sales_history"]) > HISTORY_LIMIT:
+        del state["sales_history"][:-HISTORY_LIMIT]
+    shop["sales_count"] = int(shop.get("sales_count", 0)) + 1
+    shop["sales_volume"] = round(float(shop.get("sales_volume", 0.0)) + float(tx.get("gross", 0.0)), 2)
+    state.setdefault("transactions", {}).pop(tx["id"], None)
+    _save()
+
+
+def _warn_empty_stock(shop, sample_item, inv_chest):
+    if shop.get("mode") != "SELL" or count_items_in_chest(inv_chest, sample_item) > 0:
+        if count_items_in_chest(inv_chest, sample_item) > 0:
+            shop["empty_warned_at"] = 0
+        return
+    now = now_sec()
+    if now - int(shop.get("empty_warned_at", 0)) < EMPTY_WARNING_COOLDOWN:
+        return
+    shop["empty_warned_at"] = now
+    notify_player(shop.get("owner_uuid"), shop.get("owner_name"),
+                  u"§6§l[Трейдхолл] §cВ лавке закончился товар: §f%s§c." % get_item_display_name(sample_item))
+    _save()
+
+
+def _trade_failure(player, tx, message):
+    _transaction_update(tx, "ROLLED_BACK", message)
+    player.sendMessage(u"§c✗ §7Сделка отменена: " + _to_unicode(message))
+    try:
+        player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, 1.0, 1.0)
+    except Exception:
+        pass
+
+
+def _trade_compensation_failure(player, tx, message):
+    _transaction_update(tx, "AMBIGUOUS_COMPENSATION", message)
+    player.sendMessage(u"§cСделка остановлена; компенсацию нужно проверить администратору. ID: §f" + tx.get("id"))
+
+
+def execute_trade(buyer_or_seller, shop, param):
+    """Journaled trade service with compensating inventory/money rollbacks."""
+    with trade_lock:
+        mode = shop.get("mode", "SELL")
+        sample_item = yaml_to_item(shop.get("item_yaml"))
+        inv_chest = get_shop_chest_inventory(shop)
+        if not sample_item or not inv_chest:
+            buyer_or_seller.sendMessage(u"§c✗ §7Лавка или образец товара недоступны.")
+            return
+        owner_uuid = shop.get("owner_uuid")
+        owner_name = shop.get("owner_name", u"Владелец")
+        actor_uuid = uid(buyer_or_seller)
+        if actor_uuid == owner_uuid:
+            buyer_or_seller.sendMessage(u"§c✗ §7Нельзя торговать в собственной лавке.")
+            return
+        price = max(0.01, float(shop.get("price_per_item", 0.0)))
+
+        if mode == "SELL":
+            available = count_items_in_chest(inv_chest, sample_item)
+            affordable = int(EconomyHelper.get_balance(actor_uuid) // price)
+            capacity = count_free_space_in_chest(buyer_or_seller.getInventory(), sample_item)
+            qty = min(available, affordable, capacity) if param == u"all" else int(param)
+            if qty <= 0 or qty > available or qty > affordable or qty > capacity:
+                buyer_or_seller.sendMessage(u"§c✗ §7Недостаточно товара, денег или места в инвентаре.")
+                _warn_empty_stock(shop, sample_item, inv_chest)
+                return
+            payer_uuid, payer_name = actor_uuid, buyer_or_seller.getName()
+            receiver_uuid, receiver_name = owner_uuid, owner_name
+        else:
+            player_items = count_items_in_chest(buyer_or_seller.getInventory(), sample_item)
+            capacity = count_free_space_in_chest(inv_chest, sample_item)
+            affordable = int(EconomyHelper.get_balance(owner_uuid) // price)
+            qty = min(player_items, affordable, capacity) if param == u"all" else int(param)
+            if qty <= 0 or qty > player_items or qty > affordable or qty > capacity:
+                buyer_or_seller.sendMessage(u"§c✗ §7Недостаточно товара, денег скупщика или места на складе.")
+                return
+            payer_uuid, payer_name = owner_uuid, owner_name
+            receiver_uuid, receiver_name = actor_uuid, buyer_or_seller.getName()
+
+        gross = round(float(qty) * price, 2)
+        # The shop keeps its city affiliation from creation; changing the
+        # owner's residence later must not silently reroute local sales tax.
+        city = TownHelper.get_city_by_name(shop.get("town")) or TownHelper.get_city(owner_uuid)
+        tax_percent = TownHelper.tax_percent(city)
+        tax = round(gross * tax_percent / 100.0, 2)
+        net = round(gross - tax, 2)
+        tx_id = "th-{0}-{1}".format(now_sec(), str(uuid.uuid4())[:8])
+        tx = {"id": tx_id, "shop_key": "%s:%s,%s,%s" % (shop.get("world"), shop.get("x"), shop.get("y"), shop.get("z")),
+              "mode": mode, "actor_uuid": actor_uuid, "actor_name": buyer_or_seller.getName(),
+              "owner_uuid": owner_uuid, "owner_name": owner_name, "item": get_item_display_name(sample_item),
+              "item_yaml": shop.get("item_yaml"), "quantity": qty, "unit_price": price,
+              "gross": gross, "tax": tax, "tax_percent": tax_percent,
+              "town": TownHelper.city_name(city), "status": "PREPARED", "created_at": now_sec()}
+        state.setdefault("transactions", {})[tx_id] = tx
+        if not _save():
+            state["transactions"].pop(tx_id, None)
+            buyer_or_seller.sendMessage(u"§c✗ §7Не удалось подготовить атомарную сделку.")
+            return
+
+        if not EconomyHelper.withdraw(payer_uuid, gross):
+            _trade_failure(buyer_or_seller, tx, u"списание денег не прошло")
+            return
+        _transaction_update(tx, "MONEY_RESERVED")
+
+        source_inv = inv_chest if mode == "SELL" else buyer_or_seller.getInventory()
+        target_inv = buyer_or_seller.getInventory() if mode == "SELL" else inv_chest
+        if not remove_items_from_chest(source_inv, sample_item, qty):
+            if EconomyHelper.deposit_checked(payer_uuid, gross, payer_name):
+                _trade_failure(buyer_or_seller, tx, u"товар исчез со склада до завершения сделки")
+            else:
+                _trade_compensation_failure(buyer_or_seller, tx, u"товар исчез, возврат денег не подтверждён")
+            return
+        if not add_items_to_chest(target_inv, sample_item, qty):
+            item_ok = add_items_to_chest(source_inv, sample_item, qty)
+            money_ok = EconomyHelper.deposit_checked(payer_uuid, gross, payer_name)
+            if item_ok and money_ok:
+                _trade_failure(buyer_or_seller, tx, u"не удалось переместить товар")
+            else:
+                _trade_compensation_failure(buyer_or_seller, tx, u"неполный откат товара/денег после ошибки перемещения")
+            return
+        _transaction_update(tx, "ITEMS_MOVED")
+
+        if net > 0 and not EconomyHelper.deposit_checked(receiver_uuid, net, receiver_name):
+            removed_ok = remove_items_from_chest(target_inv, sample_item, qty)
+            restored_ok = removed_ok and add_items_to_chest(source_inv, sample_item, qty)
+            money_ok = EconomyHelper.deposit_checked(payer_uuid, gross, payer_name)
+            if restored_ok and money_ok:
+                _trade_failure(buyer_or_seller, tx, u"не удалось выплатить деньги получателю")
+            else:
+                _trade_compensation_failure(buyer_or_seller, tx, u"неполный откат после ошибки выплаты получателю")
+            return
+
+        applied_tax = tax
+        if tax > 0 and not TownHelper.add_tax(city, tax):
+            # A missing town integration must never eat the player's money.
+            if not EconomyHelper.deposit_checked(receiver_uuid, tax, receiver_name):
+                _transaction_update(tx, "AMBIGUOUS_TAX_PAYOUT", u"налог не принят городом и не возвращён получателю")
+                buyer_or_seller.sendMessage(u"§cСделка проведена, но налоговая выплата требует проверки администратора: " + tx_id)
+                return
+            applied_tax = 0.0
+        tx["tax"] = applied_tax
+        tx["net"] = gross - applied_tax
+        tx["status"] = "COMPLETED"
+
+        _archive_sale(tx, shop)
+        buyer_or_seller.sendMessage(u"§a✓ §7Сделка завершена: §f%d шт. %s §7за §e%s§7 (налог: §6%s§7)." %
+                                    (qty, get_item_display_name(sample_item), format_currency(gross), format_currency(applied_tax)))
+        buyer_or_seller.playSound(buyer_or_seller.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0, 1.2)
+        notify_player(owner_uuid, owner_name,
+                      u"§6§l[Трейдхолл] §7Сделка в вашей лавке: §f%d шт. %s§7, оборот §e%s§7, налог §6%s§7." %
+                      (qty, get_item_display_name(sample_item), format_currency(gross), format_currency(applied_tax)))
+        _warn_empty_stock(shop, sample_item, inv_chest)
+        _save()
+        open_shop_gui(buyer_or_seller, tx["shop_key"])
+
+
 def on_player_interact(event):
     player = event.getPlayer()
     block = event.getClickedBlock()
@@ -969,6 +1193,21 @@ def on_player_chat(event):
     if u_player not in pending_creations:
         return
 
+    if hasattr(event, "isAsynchronous") and event.isAsynchronous():
+        captured_message = _to_unicode(event.getMessage())
+        event.setCancelled(True)
+
+        class SyncCreationEvent(object):
+            def getPlayer(self):
+                return player
+            def getMessage(self):
+                return captured_message
+            def setCancelled(self, value):
+                pass
+
+        scheduler.runTask(lambda: on_player_chat(SyncCreationEvent()))
+        return
+
     msg = _norm(event.getMessage())
     event.setCancelled(True)
 
@@ -1013,7 +1252,11 @@ def on_player_chat(event):
         "mode": mode,
         "price_per_item": round(price, 2),
         "item_yaml": item_yaml,
-        "created_at": now_sec()
+        "created_at": now_sec(),
+        "town": TownHelper.city_name(TownHelper.get_city(u_player)),
+        "empty_warned_at": 0,
+        "sales_count": 0,
+        "sales_volume": 0.0
     }
     state["shops"][b_key] = shop_data
     _save()
@@ -1064,6 +1307,8 @@ def _tick_shop_particles():
             if mode == "SELL":
                 if count_items_in_chest(inv, sample) > 0:
                     world.spawnParticle(Particle.HAPPY_VILLAGER, loc, 2, 0.2, 0.1, 0.2, 0.01)
+                else:
+                    _warn_empty_stock(shop, sample, inv)
             else:
                 if count_free_space_in_chest(inv, sample) > 0 and EconomyHelper.get_balance(shop.get("owner_uuid")) >= float(shop.get("price_per_item", 10.0)):
                     world.spawnParticle(Particle.WAX_ON, loc, 2, 0.2, 0.1, 0.2, 0.01)
@@ -1077,6 +1322,52 @@ def _tick_shop_particles():
 def on_tradehall_command(sender, label, args):
     args_list = [_norm(x) for x in args]
     sub = args_list[0] if len(args_list) > 0 else u"help"
+
+    if sub in [u"search", u"find", u"поиск"]:
+        if not isinstance(sender, Player):
+            sender.sendMessage(u"Поиск по предмету в руке доступен только игроку.")
+            return True
+        sample = sender.getInventory().getItemInMainHand()
+        if not sample or sample.getType() == Material.AIR:
+            sender.sendMessage(u"§cВозьмите искомый предмет в основную руку.")
+            return True
+        matches = []
+        for shop_key, shop in state.get("shops", {}).items():
+            shop_sample = yaml_to_item(shop.get("item_yaml"))
+            if shop_sample and is_same_item(sample, shop_sample):
+                inv = get_shop_chest_inventory(shop)
+                amount = count_items_in_chest(inv, shop_sample) if shop.get("mode") == "SELL" else count_free_space_in_chest(inv, shop_sample)
+                if amount > 0:
+                    matches.append((float(shop.get("price_per_item", 0.0)), shop_key, shop, amount))
+        matches.sort(key=lambda row: row[0])
+        sender.sendMessage(u"§6§l[Трейдхолл] §7Найдено лавок: §f%d" % len(matches))
+        for price, shop_key, shop, amount in matches[:20]:
+            mode_text = u"§aПРОДАЖА" if shop.get("mode") == "SELL" else u"§bСКУПКА"
+            sender.sendMessage(u"  %s §7| §e%s §7| §f%d шт. §7| §8%s" %
+                               (mode_text, format_currency(price), amount, shop_key))
+        return True
+
+    if sub in [u"history", u"sales", u"журнал"]:
+        if not isinstance(sender, Player) and not _is_admin(sender):
+            return True
+        sender_uuid = uid(sender) if isinstance(sender, Player) else None
+        records = [r for r in reversed(state.get("sales_history", []))
+                   if sender_uuid is None or sender_uuid in [r.get("owner_uuid"), r.get("actor_uuid")]][:15]
+        sender.sendMessage(u"§6§l[Трейдхолл] §eПоследние сделки:")
+        for record in records:
+            sender.sendMessage(u"  §8%s §7| §f%dx %s §7| §e%s §7| налог §6%s" %
+                               (record.get("id"), int(record.get("quantity", 0)), record.get("item"),
+                                format_currency(record.get("gross", 0)), format_currency(record.get("tax", 0))))
+        if not records:
+            sender.sendMessage(u"  §7Записей нет.")
+        return True
+
+    if sub in [u"journal", u"pending"] and _is_admin(sender):
+        entries = state.get("transactions", {})
+        sender.sendMessage(u"§6§l[Трейдхолл] §eНезакрытые/откаченные операции: §f%d" % len(entries))
+        for tx_id, tx in list(entries.items())[-20:]:
+            sender.sendMessage(u"  §8%s §7| §f%s §7| §c%s" % (tx_id, tx.get("status"), tx.get("error", u"-")))
+        return True
 
     if sub == u"list":
         sender.sendMessage(u"§8[Трейдхолл] §7Список торговых сундуков сервера: §a%d шт." % len(state["shops"]))
@@ -1142,6 +1433,10 @@ def on_tradehall_command(sender, label, args):
     sender.sendMessage(u"  §7• §fShift+ПКМ§7 по своей лавке — пополнить сундук.")
     sender.sendMessage(u"  §7• §fShift+ЛКМ§7 по своей лавке (или §e/tradehall remove§7) — удалить лавку.")
     sender.sendMessage(u"  §e/tradehall list §7— список активных лавок сервера.")
+    sender.sendMessage(u"  §e/tradehall search §7— найти лавки с предметом из основной руки.")
+    sender.sendMessage(u"  §e/tradehall history §7— журнал ваших покупок и продаж.")
+    if _is_admin(sender):
+        sender.sendMessage(u"  §e/tradehall journal §7— незавершённые и спорные транзакции.")
     return True
 
 # Резервная регистрация через CommandMap для мгновенного появления в Tab-Completion Bukkit
@@ -1339,11 +1634,13 @@ def on_enable():
     listener_mgr.registerListener(on_inventory_click, InventoryClickEvent)
     listener_mgr.registerListener(on_inventory_drag, InventoryDragEvent)
     listener_mgr.registerListener(on_inventory_close, InventoryCloseEvent)
+    listener_mgr.registerListener(on_player_join, PlayerJoinEvent)
 
     # В PySpigot 0.9.1 первым аргументом передаётся функция-обработчик (PyFunction)
     try:
         cmd_mgr.registerCommand(on_tradehall_command, "tradehall")
         cmd_mgr.registerCommand(on_tradehall_command, "th")
+        cmd_mgr.registerCommand(on_tradehall_command, "thall")
     except TypeError:
         try:
             cmd_mgr.registerCommand(on_tradehall_command)
@@ -1351,8 +1648,8 @@ def on_enable():
             Bukkit.getLogger().warning("[tradehall_shop] registerCommand fallback: " + str(ex))
 
     # Прямая регистрация в Bukkit CommandMap для Tab-Completion / алиасов / гарантии работы
-    cmd_obj = PyBukkitCommand("tradehall", "TradeHall buy/sell shops", "/tradehall <list|reload|help>", ["th"], on_tradehall_command)
-    force_register_bukkit_command("smarty-tradehall", cmd_obj, ["th"])
+    cmd_obj = PyBukkitCommand("tradehall", "TradeHall buy/sell shops", "/tradehall <search|list|history|reload|help>", ["th", "thall"], on_tradehall_command)
+    force_register_bukkit_command("smarty-tradehall", cmd_obj, ["th", "thall"])
 
     scheduler.runTaskLater(_tick_shop_particles, 40)
     Bukkit.getLogger().info("[tradehall_shop] Buy & Sell TradeHall chests loaded successfully.")
@@ -1363,7 +1660,7 @@ def on_disable():
     # PySpigot снимает автоматически. Но их ДУБЛИРУЮЩАЯ прямая копия в CommandMap
     # (force_register_bukkit_command выше) находится вне видимости PySpigot и её
     # нужно снять вручную - иначе команда продолжит работать даже после выгрузки.
-    force_unregister_bukkit_command("smarty-tradehall", "tradehall", ["th"])
+    force_unregister_bukkit_command("smarty-tradehall", "tradehall", ["th", "thall"])
     try:
         if hasattr(Bukkit.getServer(), "syncCommands"):
             Bukkit.getServer().syncCommands()

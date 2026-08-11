@@ -93,11 +93,12 @@ except ImportError:
     BUKKIT_AVAILABLE = False
 
 try:
-    from java.lang import String as JavaString, StringBuilder, System
+    from java.lang import String as JavaString, StringBuilder, Runnable, System
     JAVA_STRING_AVAILABLE = True
 except ImportError:
     JavaString = str
     StringBuilder = None
+    Runnable = object
     System = None
     JAVA_STRING_AVAILABLE = False
 
@@ -235,6 +236,20 @@ def format_currency(amount):
         return u"0$"
 
 
+def safe_float(value, default=0.0, minimum=None, maximum=None):
+    try:
+        result = float(value)
+        if result != result or result in (float("inf"), float("-inf")):
+            return default
+        if minimum is not None and result < minimum:
+            return default
+        if maximum is not None and result > maximum:
+            return default
+        return result
+    except Exception:
+        return default
+
+
 def parse_amount(raw):
     text = to_unicode(raw).replace(",", ".").replace(" ", "")
     amount = float(text)
@@ -259,10 +274,26 @@ def load_companies_data():
 
 
 def get_company_share_price(company):
-    available = int(company.get("available_shares", 10000))
-    start_price = float(company.get("start_price", 10.0))
-    backing = float(company.get("balance", 0.0)) + float(available) * start_price
-    return max(1.0, round(backing / 10000.0, 2))
+    try:
+        total = 10000
+        available = max(0, min(total, int(company.get("available_shares", total))))
+        issued = total - available
+        start_price = float(company.get("start_price", 10.0))
+        balance = float(company.get("balance", 0.0))
+        if "price_offset" not in company:
+            if company.get("share_price") is not None:
+                migrated_price = float(company.get("share_price"))
+                if migrated_price == migrated_price and migrated_price not in (float("inf"), float("-inf")):
+                    return max(1.0, round(migrated_price, 6))
+            return max(1.0, round((balance + available * start_price) / float(total), 6))
+        offset = float(company.get("price_offset", 0.0))
+        values = (start_price, balance, offset)
+        if any(value != value or value == float("inf") or value == float("-inf") for value in values):
+            return 0.0
+        price = start_price + balance / float(total) + issued * start_price / float(total) + offset
+        return max(1.0, round(price, 6))
+    except Exception:
+        return 0.0
 
 
 def get_company_capitalization(company):
@@ -270,13 +301,29 @@ def get_company_capitalization(company):
 
 
 def get_city_companies(city_name):
-    city_key = to_unicode(city_name).strip().lower()
+    city_keys = {to_unicode(city_name).strip().lower()}
+    try:
+        if state is not None:
+            target_city = state.get_city_by_name(city_name)
+            if target_city is not None:
+                city_keys.add(to_unicode(target_city.get("name")).strip().lower())
+                for alias in target_city.get("aliases", []):
+                    city_keys.add(to_unicode(alias).strip().lower())
+    except Exception:
+        pass
     data = load_companies_data()
     companies = []
     for company in data.get("companies", {}).values():
-        if to_unicode(company.get("town")).strip().lower() == city_key:
+        if to_unicode(company.get("town")).strip().lower() in city_keys:
             companies.append(company)
     return sorted(companies, key=lambda item: to_unicode(item.get("name")).lower())
+
+
+def player_owns_city_company(city, uuid_str):
+    for company in get_city_companies(city.get("name")):
+        if str(company.get("owner_uuid")) == str(uuid_str):
+            return True
+    return False
 
 
 def get_sender_uuid_and_name(sender):
@@ -362,6 +409,34 @@ def get_pyspigot_plugin():
     return None
 
 
+class MainThreadRunnable(Runnable):
+    def __init__(self, callback):
+        self.callback = callback
+
+    def run(self):
+        self.callback()
+
+
+def run_on_main_thread(callback):
+    """Run a Bukkit mutation now or schedule it with an unambiguous Runnable."""
+    if not BUKKIT_AVAILABLE or Bukkit is None:
+        callback()
+        return True
+    try:
+        if Bukkit.isPrimaryThread():
+            callback()
+            return True
+        plugin = get_pyspigot_plugin()
+        if plugin is None:
+            log_info(u"Cannot schedule main-thread town action: PySpigot plugin not found.")
+            return False
+        Bukkit.getScheduler().runTask(plugin, MainThreadRunnable(callback))
+        return True
+    except Exception as exc:
+        log_info(u"Cannot schedule main-thread town action: {0}".format(exc))
+        return False
+
+
 def get_player_hero(nick):
     try:
         owners = System.getProperties().get("pyspigot.character_owners")
@@ -391,7 +466,7 @@ tp_cooldowns = {}
 
 class CitiesConfig(object):
     PLUGIN_NAME = u"SmartY-Politic"
-    VERSION = u"1.5.5"
+    VERSION = u"1.5.8"
     PREFIX = u"&9&l[Политика]&r "
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
@@ -406,7 +481,8 @@ class CitiesConfig(object):
         "companies": u"Общий",
         "primary": u"Первичные акции",
         "resale": u"Перепродажа акций",
-        "dividends": u"Дивиденды"
+        "dividends": u"Дивиденды",
+        "tradehall": u"Трейдхолл"
     }
     DEFAULT_STATE = {
         "cities": {},
@@ -665,13 +741,19 @@ class CityState(object):
                     role_data.setdefault("display", role_key)
                     role_data.setdefault("color", "white")
             city.setdefault("member_roles", {})
+            city.setdefault("aliases", [])
             city.setdefault("color", "white")
-            city.setdefault("treasury", 0.0)
+            city["treasury"] = round(safe_float(city.get("treasury", 0.0), 0.0, 0.0, 10000000000000000.0), 2)
             taxes = city.setdefault("taxes", {})
             taxes.setdefault("companies", CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT)
             taxes.setdefault("primary", taxes.get("companies", CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT))
             taxes.setdefault("resale", taxes.get("companies", CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT))
             taxes.setdefault("dividends", taxes.get("companies", CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT))
+            taxes.setdefault("tradehall", taxes.get("companies", CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT))
+            for tax_key in ("companies", "primary", "resale", "dividends", "tradehall"):
+                taxes[tax_key] = round(safe_float(
+                    taxes.get(tax_key), CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT, 0.0, 100.0
+                ), 2)
             city.setdefault("members", {})
             city.setdefault("log", [])
             city.setdefault("quest_progress", {"iron": 0, "mobs": 0})
@@ -715,6 +797,48 @@ class CityState(object):
             if uuid_key in city.get("members", {}):
                 return city
         return None
+
+    def get_city_by_name(self, city_name):
+        normalized = self.normalize_name(city_name)
+        city = self.data.get("cities", {}).get(normalized)
+        if city is not None:
+            return city
+        for item in self.data.get("cities", {}).values():
+            if self.normalize_name(item.get("name")) == normalized:
+                return item
+            for alias in item.get("aliases", []):
+                if self.normalize_name(alias) == normalized:
+                    return item
+        return None
+
+    def is_active(self):
+        return initialized and state is self
+
+    def add_company_tax(self, city_name, amount):
+        try:
+            value = float(amount)
+        except Exception:
+            return False, 0.0
+        if value != value or value in (float("inf"), float("-inf")) or value <= 0.0:
+            return False, 0.0
+        city = self.get_city_by_name(city_name)
+        if city is None:
+            return False, 0.0
+        treasury = self.change_treasury(city, value, actor_name=u"Налог предприятий")
+        return (treasury is not None), (treasury if treasury is not None else float(city.get("treasury", 0.0)))
+
+    def get_company_tax_percent(self, city_name, operation, default_percent):
+        city = self.get_city_by_name(city_name)
+        if city is None:
+            return float(default_percent)
+        taxes = city.get("taxes", {})
+        try:
+            percent = float(taxes.get(operation, taxes.get("companies", default_percent)))
+            if percent != percent or percent in (float("inf"), float("-inf")):
+                return float(default_percent)
+            return max(0.0, min(100.0, percent))
+        except Exception:
+            return float(default_percent)
 
     # ФИКС: отключение телепортов к себе через &f/town tp off&r.
     # Если игрок выключил свои входящие телепорты, он АВТОМАТИЧЕСКИ
@@ -761,7 +885,8 @@ class CityState(object):
                 "companies": CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT,
                 "primary": CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT,
                 "resale": CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT,
-                "dividends": CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT
+                "dividends": CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT,
+                "tradehall": CitiesConfig.DEFAULT_COMPANY_TAX_PERCENT
             },
             "color": "white",
             "roles": {
@@ -792,10 +917,15 @@ class CityState(object):
 
     def delete_city(self, city):
         city_id = city.get("id")
+        audit_snapshot = list(self.data.get("server_audit", []))
         if city_id in self.data.get("cities", {}):
             del self.data["cities"][city_id]
         self.add_server_audit(u"§cРаспущен город §e%s" % to_unicode(city.get("name")))
-        self.save()
+        if not self.save():
+            self.data.setdefault("cities", {})[city_id] = city
+            self.data["server_audit"] = audit_snapshot
+            return False
+        return True
 
     def add_server_audit(self, msg):
         audit_list = self.data.setdefault("server_audit", [])
@@ -867,6 +997,24 @@ class CityState(object):
             return None
         return city["treasury"]
 
+    def set_treasury(self, city, amount, actor_name=None):
+        snapshot = copy.deepcopy(city)
+        try:
+            value = float(amount)
+        except Exception:
+            return None
+        if value != value or value in (float("inf"), float("-inf")) or value < 0.0 or value > 10000000000000000.0:
+            return None
+        city["treasury"] = round(value, 2)
+        if actor_name:
+            self.add_treasury_log(city, u"§f" + to_unicode(actor_name) + u" §eустановил казну: " + format_currency(value))
+        city["updated_at"] = int(time.time())
+        if not self.save():
+            city.clear()
+            city.update(snapshot)
+            return None
+        return city["treasury"]
+
     def add_treasury_log(self, city, msg):
         log_list = city.setdefault("log", [])
         t_str = time.strftime("%d.%m %H:%M")
@@ -884,22 +1032,53 @@ class CityState(object):
         self.save()
 
     def set_tax(self, city, tax_type, percent):
+        snapshot = copy.deepcopy(city)
+        try:
+            value = float(percent)
+        except Exception:
+            return False
+        if value != value or value in (float("inf"), float("-inf")) or value < 0.0 or value > 100.0:
+            return False
         taxes = city.setdefault("taxes", {})
-        taxes[tax_type] = round(max(0.0, float(percent)), 2)
-        self.add_treasury_log(city, u"§eНалог %s установлен: %s%%" % (to_unicode(tax_type), str(percent)))
+        taxes[tax_type] = round(value, 2)
+        # Общая ставка предприятий является мастер-ставкой. Раньше GUI менял
+        # только ``companies``, тогда как биржа читала ``primary``, ``resale``
+        # и ``dividends``. В результате отображаемый налог и реальное списание
+        # расходились. Явная настройка отдельного типа по-прежнему меняет
+        # только выбранную операцию.
+        if tax_type == "companies":
+            for operation in ("primary", "resale", "dividends", "tradehall"):
+                taxes[operation] = round(value, 2)
+        self.add_treasury_log(city, u"§eНалог %s установлен: %s%%" % (to_unicode(tax_type), str(value)))
         city["updated_at"] = int(time.time())
-        self.save()
+        if not self.save():
+            city.clear()
+            city.update(snapshot)
+            return False
+        return True
 
     def rename_city(self, city, new_name):
+        snapshot = copy.deepcopy(city)
         old_id = city.get("id")
+        old_name = city.get("name")
         new_id = self.normalize_name(new_name)
+        aliases = city.setdefault("aliases", [])
+        if old_name and self.normalize_name(old_name) != new_id and old_name not in aliases:
+            aliases.append(to_unicode(old_name))
+            if len(aliases) > 10:
+                del aliases[:-10]
         city["id"] = new_id
         city["name"] = to_unicode(new_name).strip()
         city["updated_at"] = int(time.time())
         if old_id in self.data.get("cities", {}):
             del self.data["cities"][old_id]
         self.data.setdefault("cities", {})[new_id] = city
-        self.save()
+        if not self.save():
+            self.data["cities"].pop(new_id, None)
+            city.clear()
+            city.update(snapshot)
+            self.data["cities"][old_id] = city
+            return None
         return city
 
     def create_role(self, city, role_name):
@@ -1132,9 +1311,11 @@ class CityService(object):
         if tax_key == "all":
             tax_key = "companies"
         if tax_key not in CitiesConfig.TAX_TYPES:
-            send_message(sender, CitiesConfig.PREFIX + u"&cТип налога: &ecompanies, primary, resale, dividends")
+            send_message(sender, CitiesConfig.PREFIX + u"&cТип налога: &ecompanies, primary, resale, dividends, tradehall")
             return
-        self.state.set_tax(city, tax_key, percent)
+        if not self.state.set_tax(city, tax_key, percent):
+            send_message(sender, CitiesConfig.PREFIX + u"&cНалог не изменен: значение некорректно или данные не удалось сохранить.")
+            return
         send_message(sender, CitiesConfig.PREFIX + u"&aНалог &e{0}&a города &b{1}&a установлен: &e{2}%&a.".format(
             CitiesConfig.TAX_TYPES.get(tax_key, tax_key),
             city.get("name"),
@@ -1236,6 +1417,9 @@ class CityService(object):
         if str(account.uuid) == str(city.get("mayor_uuid")):
             send_message(sender, CitiesConfig.PREFIX + u"&cНельзя удалить мэра. Сначала назначьте другого мэра.")
             return
+        if player_owns_city_company(city, account.uuid):
+            send_message(sender, CitiesConfig.PREFIX + u"&cНельзя удалить владельца предприятия. Сначала предприятие должно быть закрыто.")
+            return
         self.state.remove_member(city, account.uuid)
         self.reset_player_color_by_name(account.name)
         send_message(sender, CitiesConfig.PREFIX + u"&aИгрок &e{0}&a удален из города.".format(account.name))
@@ -1270,6 +1454,9 @@ class CityService(object):
             return
         old_name = city.get("name")
         city = self.state.rename_city(city, new_name)
+        if city is None:
+            send_message(sender, CitiesConfig.PREFIX + u"&cПереименование отменено: данные города не удалось сохранить.")
+            return
         send_message(sender, CitiesConfig.PREFIX + u"&aГород &e{0}&a переименован в &e{1}&a.".format(old_name, city.get("name")))
 
     def set_color(self, sender, color_name):
@@ -1415,6 +1602,9 @@ class CityService(object):
         if str(city.get("mayor_uuid")) == str(uuid_str):
             send_message(sender, CitiesConfig.PREFIX + u"&cМэр не может выйти. Передайте пост или распустите город.")
             return
+        if player_owns_city_company(city, uuid_str):
+            send_message(sender, CitiesConfig.PREFIX + u"&cСначала закройте принадлежащие вам предприятия этого города.")
+            return
         self.state.remove_member(city, uuid_str)
         self.reset_player_color(sender)
         send_message(sender, CitiesConfig.PREFIX + u"&aВы покинули город &e{0}&a.".format(city["name"]))
@@ -1425,12 +1615,18 @@ class CityService(object):
             return
         if not self.can_manage(sender, city):
             return
+        if get_city_companies(city.get("name")):
+            send_message(sender, CitiesConfig.PREFIX + u"&cНельзя распустить город, пока в нем зарегистрированы предприятия.")
+            return
         name = city.get("name")
-        for player_uuid in list(city.get("members", {}).keys()):
+        member_uuids = list(city.get("members", {}).keys())
+        if not self.state.delete_city(city):
+            send_message(sender, CitiesConfig.PREFIX + u"&cГород не удален: данные не удалось сохранить.")
+            return
+        for player_uuid in member_uuids:
             player = self.get_online_player_by_uuid(player_uuid)
             if player:
                 self.reset_player_color(player)
-        self.state.delete_city(city)
         send_message(sender, CitiesConfig.PREFIX + u"&cГород &e{0}&c удален. Казна удаленного города сгорает.".format(name))
 
     # ----- ДОМ ГОРОДА (/town home / /town sethome) -----
@@ -1882,6 +2078,45 @@ def material_value(name, fallback):
             return Material.valueOf(fallback)
         except Exception:
             return None
+
+
+def remove_inventory_material(inventory, material, amount):
+    remaining = int(amount)
+    if remaining <= 0:
+        return True
+    if not inventory.contains(material, remaining):
+        return False
+    contents = inventory.getContents()
+    for slot in range(len(contents)):
+        item = contents[slot]
+        if item is None or item.getType() != material:
+            continue
+        take = min(remaining, int(item.getAmount()))
+        new_amount = int(item.getAmount()) - take
+        if new_amount <= 0:
+            inventory.setItem(slot, None)
+        else:
+            item.setAmount(new_amount)
+            inventory.setItem(slot, item)
+        remaining -= take
+        if remaining <= 0:
+            return True
+    return False
+
+
+def refund_inventory_material(player, material, amount):
+    remaining = int(amount)
+    max_stack = max(1, int(material.getMaxStackSize()))
+    while remaining > 0:
+        stack_size = min(max_stack, remaining)
+        leftovers = player.getInventory().addItem(ItemStack(material, stack_size))
+        if leftovers:
+            try:
+                for item in leftovers.values():
+                    player.getWorld().dropItemNaturally(player.getLocation(), item)
+            except Exception:
+                pass
+        remaining -= stack_size
 
 
 def create_gui_item(material_name, title, lore=None, fallback="PAPER"):
@@ -2527,28 +2762,28 @@ class TownQuestsGUI(BaseTownGUI):
                 send_message(player, CitiesConfig.PREFIX + u"&aКвест «Железный запас» уже выполнен!")
                 return
             inv = player.getInventory()
-            count = 64 if click_type in ("RIGHT", "RIGHT_CLICK") else 1
+            count = 64 - q_iron if click_type in ("RIGHT", "RIGHT_CLICK") else 1
             if not inv.contains(Material.IRON_INGOT, count):
                 send_message(player, CitiesConfig.PREFIX + u"&cУ вас в инвентаре нет {0} железных слитков!".format(count))
                 return
-            to_remove = count
-            for item in inv.getContents():
-                if item and item.getType() == Material.IRON_INGOT:
-                    if item.getAmount() <= to_remove:
-                        to_remove -= item.getAmount()
-                        inv.remove(item)
-                    else:
-                        item.setAmount(item.getAmount() - to_remove)
-                        to_remove = 0
-                    if to_remove <= 0:
-                        break
+            city_snapshot = copy.deepcopy(city)
+            if not remove_inventory_material(inv, Material.IRON_INGOT, count):
+                send_message(player, CitiesConfig.PREFIX + u"&cНе удалось списать железные слитки. Попробуйте снова.")
+                return
             city["quest_progress"]["iron"] = min(64, q_iron + count)
-            send_message(player, CitiesConfig.PREFIX + u"&aВы сдали &e{0} &aжелезных слитков в городской квест!".format(count))
-            if city["quest_progress"]["iron"] >= 64:
+            completed = city["quest_progress"]["iron"] >= 64
+            if completed:
                 state.add_treasury_log(city, u"§a§lКвест «Железный запас» выполнен!")
                 city["treasury"] = city.get("treasury", 0.0) + 1000.0
+            if not state.save():
+                city.clear()
+                city.update(city_snapshot)
+                refund_inventory_material(player, Material.IRON_INGOT, count)
+                send_message(player, CitiesConfig.PREFIX + u"&cПрогресс квеста не сохранен. Предметы возвращены.")
+                return
+            send_message(player, CitiesConfig.PREFIX + u"&aВы сдали &e{0} &aжелезных слитков в городской квест!".format(count))
+            if completed:
                 send_message(player, CitiesConfig.PREFIX + u"&a&lКвест выполнен! В казну начислено +1000$.")
-            state.save()
             self.open()
 
         elif 14 <= raw_slot < 27:
@@ -2570,25 +2805,26 @@ class TownQuestsGUI(BaseTownGUI):
             if not inv.contains(mat_enum, count):
                 send_message(player, CitiesConfig.PREFIX + u"&cУ вас в инвентаре нет %d шт. %s!" % (count, mat_name))
                 return
-            to_remove = count
-            for item in inv.getContents():
-                if item and item.getType() == mat_enum:
-                    if item.getAmount() <= to_remove:
-                        to_remove -= item.getAmount()
-                        inv.remove(item)
-                    else:
-                        item.setAmount(item.getAmount() - to_remove)
-                        to_remove = 0
-                    if to_remove <= 0:
-                        break
+            city_snapshot = copy.deepcopy(city)
+            if not remove_inventory_material(inv, mat_enum, count):
+                send_message(player, CitiesConfig.PREFIX + u"&cНе удалось списать предметы. Попробуйте снова.")
+                return
             city["quest_progress"][qid] = min(req_cnt, q_prog + count)
-            send_message(player, CitiesConfig.PREFIX + u"&aВы сдали &e%d шт. %s &aв квест!" % (count, mat_name))
-            if city["quest_progress"][qid] >= req_cnt:
-                reward = float(qdata.get("reward_money", 1000.0))
+            completed = city["quest_progress"][qid] >= req_cnt
+            reward = 0.0
+            if completed:
+                reward = safe_float(qdata.get("reward_money", 1000.0), 0.0, 0.0, 10000000000000000.0)
                 city["treasury"] = city.get("treasury", 0.0) + reward
                 state.add_treasury_log(city, u"§a§lКвест «%s» выполнен! +%s" % (qdata.get("title", qid), format_currency(reward)))
+            if not state.save():
+                city.clear()
+                city.update(city_snapshot)
+                refund_inventory_material(player, mat_enum, count)
+                send_message(player, CitiesConfig.PREFIX + u"&cПрогресс квеста не сохранен. Предметы возвращены.")
+                return
+            send_message(player, CitiesConfig.PREFIX + u"&aВы сдали &e%d шт. %s &aв квест!" % (count, mat_name))
+            if completed:
                 send_message(player, CitiesConfig.PREFIX + u"&a&l✓ КВЕСТ ВЫПОЛНЕН! В казну начислено %s." % format_currency(reward))
-            state.save()
             self.open()
 
 
@@ -3269,10 +3505,15 @@ class TownProjectDetailsGUI(BaseTownGUI):
 
     def finish_project(self, city, player):
         pdata = city.setdefault("custom_projects", {}).get(self.project_id, {})
+        snapshot = copy.deepcopy(city)
         pdata["status"] = "BUILT"
         state.add_treasury_log(city, u"§a§lПОСТРОЕН ПРОЕКТ: %s!" % pdata["name"])
         state.add_server_audit(u"§aГород §e%s §aпостроил проект §f%s!" % (to_unicode(city.get("name")), pdata["name"]))
-        state.save()
+        if not state.save():
+            city.clear()
+            city.update(snapshot)
+            send_message(player, CitiesConfig.PREFIX + u"&cПроект не завершён: данные города не удалось сохранить.")
+            return
         send_message(player, CitiesConfig.PREFIX + u"&a&l✓ ПРОЕКТ «%s» УСПЕШНО ЗАВЕРШЁН!" % pdata["name"])
         TownUpgradesGUI(player).open()
 
@@ -3437,6 +3678,7 @@ class TownProjectResourceGUI(BaseTownGUI):
         if not mat_enum or not inv.contains(mat_enum, count):
             send_message(player, CitiesConfig.PREFIX + u"&cУ вас нет в инвентаре %d шт. %s." % (count, self.mat_name))
             return
+        city_snapshot = copy.deepcopy(city)
         to_remove = count
         for item in inv.getContents():
             if item and item.getType() == mat_enum:
@@ -3450,7 +3692,21 @@ class TownProjectResourceGUI(BaseTownGUI):
                     break
         cont_items = pdata.setdefault("contributed_items", {})
         cont_items[self.mat_name] = cont_items.get(self.mat_name, 0) + count
-        state.save()
+        if not state.save():
+            city.clear()
+            city.update(city_snapshot)
+            # Возвращаем изъятый ресурс. Если инвентарь заполнен между
+            # операциями, остаток безопасно выпадает рядом с игроком.
+            left = count
+            while left > 0:
+                stack = ItemStack(mat_enum, min(64, left))
+                leftovers = inv.addItem(stack)
+                if leftovers:
+                    for extra in leftovers.values():
+                        player.getWorld().dropItemNaturally(player.getLocation(), extra)
+                left -= min(64, left)
+            send_message(player, CitiesConfig.PREFIX + u"&cРесурс возвращён: фонд проекта не удалось сохранить.")
+            return
         send_message(player, CitiesConfig.PREFIX + u"&aВы сдали &e%d шт. %s &aв проект!" % (count, self.mat_name))
         # Проверяем завершение и переоткрываем это же меню.
         req_items = pdata.get("req_items", {})
@@ -3492,22 +3748,40 @@ class TownProjectResourceGUI(BaseTownGUI):
         mat_enum = material_value(self.mat_name, "STONE")
         if not mat_enum:
             return
+        # Сначала фиксируем уменьшение виртуального фонда. Это исключает дюп
+        # при падении сервера между выдачей предметов и записью cities.json.
+        city_snapshot = copy.deepcopy(city)
+        cont_items[self.mat_name] = got - take
+        if not state.save():
+            city.clear()
+            city.update(city_snapshot)
+            send_message(player, CitiesConfig.PREFIX + u"&cПредметы не выданы: фонд проекта не удалось сохранить.")
+            return
+
         # Раздаём стаками по 64.
         left = take
-        while left > 0:
-            chunk = min(64, left)
-            copy = ItemStack(mat_enum, chunk)
-            leftover = player.getInventory().addItem(copy)
-            if leftover and len(leftover) > 0:
-                # Инвентарь полон — то, что не поместилось, кидаем под ноги.
-                for stack in leftover.values():
-                    try:
+        try:
+            while left > 0:
+                chunk = min(64, left)
+                copy = ItemStack(mat_enum, chunk)
+                leftover = player.getInventory().addItem(copy)
+                if leftover and len(leftover) > 0:
+                    # Инвентарь полон — то, что не поместилось, кидаем под ноги.
+                    for stack in leftover.values():
                         player.getWorld().dropItemNaturally(player.getLocation(), stack)
-                    except Exception:
-                        pass
-            left -= chunk
-        cont_items[self.mat_name] = got - take
-        state.save()
+                left -= chunk
+        except Exception as exc:
+            # Редкий сбой Bukkit-выдачи: возвращаем ещё не выданную часть в
+            # фонд. Уже выданные предметы остаются корректно списанными.
+            if left > 0:
+                refreshed = city.setdefault("custom_projects", {}).get(self.project_id, pdata)
+                refreshed.setdefault("contributed_items", {})[self.mat_name] = \
+                    refreshed.setdefault("contributed_items", {}).get(self.mat_name, 0) + left
+                if not state.save():
+                    log_info(u"CRITICAL: failed to restore unissued project items {0} x{1}: {2}".format(
+                        self.mat_name, left, exc))
+            send_message(player, CitiesConfig.PREFIX + u"&cЧасть предметов не удалось выдать; остаток возвращён в фонд.")
+            return
         send_message(player, CitiesConfig.PREFIX + u"&6Вы забрали &e%d шт. %s &6из фонда проекта." % (take, self.mat_name))
         self.open()
 
@@ -3758,8 +4032,11 @@ class AdminMainGUI(BaseTownGUI):
         elif raw_slot == 12:
             uuid_str, name = get_sender_uuid_and_name(player)
             amount = 250000.0 if click_type in ("RIGHT", "RIGHT_CLICK") else 50000.0
-            economy.deposit(uuid_str, amount, name)
-            send_message(player, CitiesConfig.PREFIX + u"&a&l[ADMIN] &aВам выдано +%s!" % format_currency(amount))
+            deposited, balance = economy.deposit_checked(uuid_str, amount, name)
+            if deposited:
+                send_message(player, CitiesConfig.PREFIX + u"&a&l[ADMIN] &aВам выдано +%s!" % format_currency(amount))
+            else:
+                send_message(player, CitiesConfig.PREFIX + u"&cВыдача не выполнена: экономика недоступна или баланс достиг лимита.")
             self.open()
         elif raw_slot == 14:
             AdminAuditGUI(player).open()
@@ -4266,13 +4543,16 @@ class AdminCityManageGUI(BaseTownGUI):
             return
 
         if raw_slot == 10:
+            result = None
             if is_shift:
-                city["treasury"] = 50000.0
-                state.save()
+                result = state.set_treasury(city, 50000.0, actor_name=player.getName())
             elif click_type in ("RIGHT", "RIGHT_CLICK"):
-                state.change_treasury(city, -10000.0, actor_name=player.getName())
+                result = state.change_treasury(city, -10000.0, actor_name=player.getName())
             else:
-                state.change_treasury(city, 10000.0, actor_name=player.getName())
+                result = state.change_treasury(city, 10000.0, actor_name=player.getName())
+            if result is None:
+                send_message(player, CitiesConfig.PREFIX + u"&cКазну не удалось изменить. Проверьте сумму и хранилище.")
+                return
             send_message(player, CitiesConfig.PREFIX + u"&a&l[ADMIN] &aКазна города изменена: %s" % format_currency(city.get("treasury", 0.0)))
             self.open()
 
@@ -4314,12 +4594,18 @@ class AdminCityManageGUI(BaseTownGUI):
             if not is_shift:
                 send_message(player, CitiesConfig.PREFIX + u"&cДля удаления города нажмите &eShift+ЛКМ&c!")
                 return
+            if get_city_companies(city.get("name")):
+                send_message(player, CitiesConfig.PREFIX + u"&cСначала закройте все предприятия этого города.")
+                return
             name = city.get("name")
-            for player_uuid in list(city.get("members", {}).keys()):
+            member_uuids = list(city.get("members", {}).keys())
+            if not state.delete_city(city):
+                send_message(player, CitiesConfig.PREFIX + u"&cГород не удален: данные не удалось сохранить.")
+                return
+            for player_uuid in member_uuids:
                 p = service.get_online_player_by_uuid(player_uuid)
                 if p:
                     service.reset_player_color(p)
-            state.delete_city(city)
             send_message(player, CitiesConfig.PREFIX + u"&c&l[ADMIN] &cГород %s распущен." % name)
             AdminCitiesListGUI(player, 1).open()
 
@@ -4474,6 +4760,8 @@ class CityCommand(object):
 
         if action == "reqmoney" and len(args) >= 4:
             val = self.safe_amount(sender, args[3])
+            if val <= 0:
+                return
             pdata["req_money"] = val
             self.state.save()
             send_message(sender, CitiesConfig.PREFIX + u"&aБюджет проекта &e%s &aустановлен: %s" % (pdata["name"], format_currency(val)))
@@ -4481,7 +4769,9 @@ class CityCommand(object):
 
         if action == "addreq" and len(args) >= 5:
             mat_name = to_unicode(args[3]).upper()
-            count = max(1, int(args[4]))
+            count = self.safe_positive_int(sender, args[4], u"Количество")
+            if count is None:
+                return
             mat_enum = material_value(mat_name, None)
             if not mat_enum:
                 send_message(sender, CitiesConfig.PREFIX + u"&cМатериал &f%s &cне найден в Minecraft!" % mat_name)
@@ -4492,7 +4782,9 @@ class CityCommand(object):
             return
 
         if action == "addhand" and len(args) >= 4:
-            count = max(1, int(args[3]))
+            count = self.safe_positive_int(sender, args[3], u"Количество")
+            if count is None:
+                return
             if not hasattr(sender, "getInventory"):
                 return
             in_hand = sender.getInventory().getItemInMainHand()
@@ -4507,9 +4799,18 @@ class CityCommand(object):
             return
 
         if action == "duration" and len(args) >= 4:
-            hours = max(1, int(args[3]))
+            hours = self.safe_positive_int(sender, args[3], u"Часы", 100000)
+            if hours is None:
+                return
+            old_duration = pdata.get("duration_sec")
             pdata["duration_sec"] = hours * 3600
-            self.state.save()
+            if not self.state.save():
+                if old_duration is None:
+                    pdata.pop("duration_sec", None)
+                else:
+                    pdata["duration_sec"] = old_duration
+                send_message(sender, CitiesConfig.PREFIX + u"&cНе удалось сохранить срок проекта. Значение не изменено.")
+                return
             send_message(sender, CitiesConfig.PREFIX + u"&aВремя строительства проекта &e%s &aустановлено: %d ч." % (pdata["name"], hours))
             return
 
@@ -4612,8 +4913,12 @@ class CityCommand(object):
                 send_message(sender, CitiesConfig.PREFIX + u"&cГород не найден.")
             else:
                 name = city.get("name")
-                self.state.delete_city(city)
-                send_message(sender, CitiesConfig.PREFIX + u"&cГород &e{0}&c удален.".format(name))
+                if get_city_companies(name):
+                    send_message(sender, CitiesConfig.PREFIX + u"&cСначала закройте все предприятия этого города.")
+                elif self.state.delete_city(city):
+                    send_message(sender, CitiesConfig.PREFIX + u"&cГород &e{0}&c удален.".format(name))
+                else:
+                    send_message(sender, CitiesConfig.PREFIX + u"&cГород не удален: данные не удалось сохранить.")
         elif sub == "setmayor" and len(args) >= 3:
             self.admin_set_mayor(sender, args[1], args[2])
         elif sub == "treasury" and len(args) >= 4:
@@ -4636,10 +4941,24 @@ class CityCommand(object):
             send_message(sender, CitiesConfig.PREFIX + u"&cНекорректная сумма.")
             return 0.0
 
+    def safe_positive_int(self, sender, raw, label=u"Число", maximum=2147483647):
+        try:
+            text = to_unicode(raw).strip()
+            value = float(text.replace(",", "."))
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError()
+            integer = int(value)
+            if value != float(integer) or integer <= 0 or integer > int(maximum):
+                raise ValueError()
+            return integer
+        except Exception:
+            send_message(sender, CitiesConfig.PREFIX + u"&c%s должно быть целым положительным числом." % label)
+            return None
+
     def safe_percent(self, sender, raw):
         try:
             value = float(to_unicode(raw).replace(",", "."))
-            if value < 0 or value > 100:
+            if value != value or value in (float("inf"), float("-inf")) or value < 0 or value > 100:
                 raise ValueError()
             return round(value, 2)
         except Exception:
@@ -4786,15 +5105,18 @@ class CityCommand(object):
         if amount <= 0:
             return
         action = action.lower()
+        total = None
         if action == "set":
-            city["treasury"] = round(amount, 2)
-            self.state.save()
+            total = self.state.set_treasury(city, amount, actor_name=u"ADMIN")
         elif action == "add":
-            self.state.change_treasury(city, amount)
+            total = self.state.change_treasury(city, amount, actor_name=u"ADMIN")
         elif action in ("take", "remove"):
-            self.state.change_treasury(city, -amount)
+            total = self.state.change_treasury(city, -amount, actor_name=u"ADMIN")
         else:
             self.send_admin_help(sender, "townadmin")
+            return
+        if total is None:
+            send_message(sender, CitiesConfig.PREFIX + u"&cКазну не удалось изменить. Недостаточно средств или ошибка сохранения.")
             return
         send_message(sender, CitiesConfig.PREFIX + u"&aКазна города &e{0}&a: &6{1}&a.".format(
             city.get("name"),
@@ -4831,7 +5153,7 @@ class CityCommand(object):
     def send_tax_help(self, sender):
         send_message(sender, CitiesConfig.PREFIX + u"&e/town tax info")
         send_message(sender, u"&e/town tax set <процент> &7- общий налог предприятий")
-        send_message(sender, u"&e/town tax set <primary|resale|dividends|companies> <процент>")
+        send_message(sender, u"&e/town tax set <primary|resale|dividends|tradehall|companies> <процент>")
 
     def send_admin_help(self, sender, label):
         send_message(sender, CitiesConfig.PREFIX + u"&e/townadmin menu &7- открыть Административное GUI")
@@ -4866,7 +5188,7 @@ class CityCommand(object):
             return build_java_list([item for item in ["info", "set"] if item.startswith(prefix)])
         if len(args) == 3 and sub == "tax" and args[1].lower() == "set":
             prefix = args[2].lower()
-            values = ["companies", "primary", "resale", "dividends", "0", "1", "2", "5", "10"]
+            values = ["companies", "primary", "resale", "dividends", "tradehall", "0", "1", "2", "5", "10"]
             return build_java_list([item for item in values if item.startswith(prefix)])
         if len(args) == 4 and sub == "tax" and args[1].lower() == "set":
             return build_java_list(["0", "1", "2", "5", "10"])
@@ -4960,11 +5282,25 @@ else:
 
 
 registered_listeners = []
+TOWN_STATE_PROPERTY = "SmartY_TownState"
 state = None
 economy = None
 service = None
 command_handler = None
 initialized = False
+
+
+def publish_town_state(manager):
+    if JAVA_STRING_AVAILABLE and System is not None:
+        try:
+            if manager is None:
+                current = System.getProperties().get(TOWN_STATE_PROPERTY)
+                if current is state:
+                    System.getProperties().remove(TOWN_STATE_PROPERTY)
+            else:
+                System.getProperties().put(TOWN_STATE_PROPERTY, manager)
+        except Exception:
+            pass
 
 
 def force_register_bukkit_command(fallback_prefix, cmd_obj, aliases):
@@ -5092,11 +5428,6 @@ def on_inventory_click(event):
             return
 
         player = event.getWhoClicked()
-        if hasattr(player, "setItemOnCursor") and ItemStack is not None and Material is not None:
-            try:
-                player.setItemOnCursor(ItemStack(Material.AIR, 1))
-            except Exception:
-                pass
         click_type = str(event.getClick()) if hasattr(event, "getClick") else "LEFT"
         holder.gui.handle_click(player, raw_slot, click_type, event.isShiftClick())
     except Exception as exc:
@@ -5163,6 +5494,10 @@ def on_player_chat(event):
                 send_message(player, CitiesConfig.PREFIX + u"&cНеверное число: §f" + raw)
                 _reopen_project_gui(player, req)
                 return
+            if value != value or value in (float("inf"), float("-inf")):
+                send_message(player, CitiesConfig.PREFIX + u"&cНужно ввести обычное конечное число.")
+                _reopen_project_gui(player, req)
+                return
             if value <= 0 and kind not in ("quest_reward",):
                 # Для награды разрешаем 0 (бесплатный квест).
                 send_message(player, CitiesConfig.PREFIX + u"&cЧисло должно быть больше нуля.")
@@ -5170,6 +5505,23 @@ def on_player_chat(event):
                 return
             if value < 0:
                 send_message(player, CitiesConfig.PREFIX + u"&cЧисло не может быть отрицательным.")
+                _reopen_project_gui(player, req)
+                return
+            integer_kinds = (
+                "quest_count", "deposit_items", "withdraw_items",
+                "set_duration_h", "add_req_item",
+            )
+            if kind in integer_kinds and value != float(int(value)):
+                send_message(player, CitiesConfig.PREFIX + u"&cДля этого поля требуется целое число.")
+                _reopen_project_gui(player, req)
+                return
+            if kind == "set_duration_h" and value > 100000:
+                send_message(player, CitiesConfig.PREFIX + u"&cСрок не может превышать 100000 часов.")
+                _reopen_project_gui(player, req)
+                return
+            if kind in ("quest_count", "deposit_items", "withdraw_items", "add_req_item") \
+                    and value > 2147483647:
+                send_message(player, CitiesConfig.PREFIX + u"&cВведённое количество слишком велико.")
                 _reopen_project_gui(player, req)
                 return
             _apply_project_input_scheduled(player, req, value)
@@ -5188,34 +5540,25 @@ def on_player_chat(event):
 
 def _reopen_project_gui(player, req):
     """Возвращает игрока в исходное меню (details / resource / manage / quest_edit)."""
-    try:
-        plugin = get_pyspigot_plugin()
-        def _run():
-            try:
-                rgui = req.get("return_gui", "details")
-                pid = req.get("project_id")
-                if rgui == "resource":
-                    TownProjectResourceGUI(player, pid, req.get("mat_name")).open()
-                elif rgui == "manage":
-                    TownProjectManageGUI(player, pid).open()
-                elif rgui == "quest_edit":
-                    AdminQuestEditGUI(player, qid=req.get("qid")).open()
-                else:
-                    TownProjectDetailsGUI(player, pid).open()
-            except Exception:
-                pass
-        if plugin is not None and Bukkit is not None:
-            Bukkit.getScheduler().runTask(plugin, _run)
-        else:
-            _run()
-    except Exception:
-        pass
+    def _run():
+        try:
+            rgui = req.get("return_gui", "details")
+            pid = req.get("project_id")
+            if rgui == "resource":
+                TownProjectResourceGUI(player, pid, req.get("mat_name")).open()
+            elif rgui == "manage":
+                TownProjectManageGUI(player, pid).open()
+            elif rgui == "quest_edit":
+                AdminQuestEditGUI(player, qid=req.get("qid")).open()
+            else:
+                TownProjectDetailsGUI(player, pid).open()
+        except Exception as exc:
+            log_info(u"Cannot reopen project GUI: {0}".format(exc))
+    run_on_main_thread(_run)
 
 
 def _apply_project_input_scheduled(player, req, value):
     """Применяет распарсенное значение к проекту/квесту в основном потоке."""
-    plugin = get_pyspigot_plugin()
-
     def _run():
         try:
             uuid_str, name = get_sender_uuid_and_name(player)
@@ -5294,8 +5637,16 @@ def _apply_project_input_scheduled(player, req, value):
                 TownProjectManageGUI(player, pid).open()
                 return
             if kind == "set_duration_h":
+                old_duration = pdata.get("duration_sec")
                 pdata["duration_sec"] = max(3600, n_int * 3600)
-                state.save()
+                if not state.save():
+                    if old_duration is None:
+                        pdata.pop("duration_sec", None)
+                    else:
+                        pdata["duration_sec"] = old_duration
+                    send_message(player, CitiesConfig.PREFIX + u"&cНе удалось сохранить срок проекта. Значение не изменено.")
+                    TownProjectManageGUI(player, pid).open()
+                    return
                 send_message(player, CitiesConfig.PREFIX + u"&aДлительность установлена: &f%d ч." % n_int)
                 TownProjectManageGUI(player, pid).open()
                 return
@@ -5310,10 +5661,8 @@ def _apply_project_input_scheduled(player, req, value):
         except Exception as exc:
             log_info(u"apply_project_input: {0}".format(exc))
 
-    if plugin is not None and Bukkit is not None:
-        Bukkit.getScheduler().runTask(plugin, _run)
-    else:
-        _run()
+    if not run_on_main_thread(_run):
+        send_message(player, CitiesConfig.PREFIX + u"&cНе удалось применить значение: планировщик сервера недоступен.")
 
 
 def on_entity_death(event):
@@ -5330,12 +5679,19 @@ def on_entity_death(event):
             return
         q_mobs = city.setdefault("quest_progress", {}).get("mobs", 0)
         if q_mobs < 25:
+            city_snapshot = copy.deepcopy(city)
             city["quest_progress"]["mobs"] = q_mobs + 1
-            if city["quest_progress"]["mobs"] == 25:
+            completed = city["quest_progress"]["mobs"] == 25
+            if completed:
                 service.state.add_treasury_log(city, u"§a§lКвест «Охота на чудовищ» выполнен!")
                 city["treasury"] = city.get("treasury", 0.0) + 2500.0
+            if not service.state.save():
+                city.clear()
+                city.update(city_snapshot)
+                log_info(u"Mob quest progress was rolled back for {0}: cities data is not writable".format(name))
+                return
+            if completed:
                 send_message(killer, CitiesConfig.PREFIX + u"&a&lКвест «Охота на чудовищ» выполнен! +2500$ в казну.")
-            service.state.save()
     except Exception as exc:
         log_info(u"Entity death error: {0}".format(exc))
 
@@ -5407,6 +5763,11 @@ def register_commands():
         registered_city_command_names.append(item[0])
         for alias in item[3]:
             registered_city_command_names.append(alias)
+    try:
+        if BUKKIT_AVAILABLE and hasattr(Bukkit.getServer(), "syncCommands"):
+            Bukkit.getServer().syncCommands()
+    except Exception as exc:
+        log_info(u"Command synchronization error: {0}".format(exc))
 
 
 def on_enable():
@@ -5436,11 +5797,13 @@ def on_enable():
         for player in Bukkit.getOnlinePlayers():
             service.apply_player_color(player)
     initialized = True
+    publish_town_state(state)
     log_info(u"Enabled.")
 
 
 def on_disable():
     global initialized
+    publish_town_state(None)
     unregister_events()
     unregister_city_commands()  # ФИКС: без этого /town /townadmin /townmenu переживали /pyspigot unload
     if state is not None:

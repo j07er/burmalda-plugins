@@ -16,6 +16,7 @@ SmartY-Economy System — ВЕРСИЯ 3.0.0 (PAYDAY & MOB MONEY DROP SYSTEM)
 import os
 import sys
 import json
+import io
 import hashlib
 import time
 import re
@@ -256,7 +257,7 @@ def reject_json_constant(value):
 # -----------------------------------------------------------------------------
 class EconomyConfig:
     PLUGIN_NAME = u"SmartY-Economy"
-    VERSION = u"3.6.6"
+    VERSION = u"3.8.1"
     PREFIX = u"&a&l[\u042d\u043a\u043e\u043d\u043e\u043c\u0438\u043a\u0430]&r "
 
     DEFAULT_BALANCE = 100.0
@@ -447,6 +448,253 @@ MOB_DISPLAY_NAMES = {
     "WITHER": u"Иссушителя",
     "ENDER_DRAGON": u"Эндер-Дракона"
 }
+
+
+# Mob rewards are intentionally conservative: direct player kills in normal
+# hunting are paid, while spawner/breeding mobs and grinder-like bursts are not.
+MOB_REWARD_WINDOW_SECONDS = 60.0
+MOB_REWARD_KILL_LIMIT = 10
+MOB_REWARD_MONEY_LIMIT = 50.0
+MOB_REWARD_AREA_LIMIT = 8
+MOB_REWARD_AREA_SIZE = 8.0
+MOB_REWARD_DENSITY_RADIUS = 12.0
+MOB_REWARD_DENSITY_LIMIT = 12
+MOB_BOSS_WINDOW_SECONDS = 3600.0
+MOB_BOSS_LIMIT = 2
+MOB_REWARD_HOURLY_LIMIT = 1000.0
+MOB_REWARD_STATE_FILE = os.path.join(EconomyConfig.DATA_DIR, "mob_reward_limits.json")
+MOB_NO_REWARD_SPAWN_REASONS = set([
+    "SPAWNER", "TRIAL_SPAWNER", "SPAWNER_EGG", "BREEDING", "BUILD_IRONGOLEM",
+    "BUILD_SNOWMAN", "BUILD_WITHER", "DISPENSE_EGG", "OCELOT_BABY",
+    "VILLAGE_DEFENSE", "SHEARED", "SLIME_SPLIT", "SILVERFISH_BLOCK",
+    "REINFORCEMENTS", "DUPLICATION", "CUSTOM", "COMMAND"
+])
+def _load_mob_reward_history():
+    try:
+        if not os.path.exists(MOB_REWARD_STATE_FILE):
+            return {}
+        f = io.open(MOB_REWARD_STATE_FILE, "r", encoding="utf-8")
+        try: data = json.load(f)
+        finally: f.close()
+        if not isinstance(data, dict):
+            return {}
+        now = time.time()
+        result = {}
+        for player_uuid, records in data.items():
+            if not isinstance(records, list): continue
+            kept = []
+            for record in records:
+                if not isinstance(record, dict): continue
+                if now - float(record.get("time", 0.0)) <= MOB_BOSS_WINDOW_SECONDS:
+                    kept.append({"time": float(record.get("time", 0.0)),
+                                 "amount": float(record.get("amount", 0.0)),
+                                 "boss": bool(record.get("boss", False))})
+            if kept: result[str(player_uuid)] = kept
+        return result
+    except Exception as exc:
+        log_error(u"Could not load mob reward limits: {0}".format(exc))
+        return {}
+
+
+def _save_mob_reward_history():
+    temp_file = MOB_REWARD_STATE_FILE + ".tmp"
+    try:
+        if not os.path.exists(EconomyConfig.DATA_DIR):
+            os.makedirs(EconomyConfig.DATA_DIR)
+        payload = json.dumps(mob_reward_history, ensure_ascii=True, indent=2, sort_keys=True)
+        if not isinstance(payload, unicode): payload = payload.decode("utf-8", "replace")
+        f = io.open(temp_file, "w", encoding="utf-8")
+        try:
+            f.write(payload)
+            f.flush()
+            try: os.fsync(f.fileno())
+            except Exception: pass
+        finally:
+            f.close()
+        try:
+            from java.nio.file import Files, Paths, StandardCopyOption
+            Files.move(Paths.get(temp_file), Paths.get(MOB_REWARD_STATE_FILE),
+                       StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        except Exception:
+            if os.path.exists(MOB_REWARD_STATE_FILE): os.remove(MOB_REWARD_STATE_FILE)
+            os.rename(temp_file, MOB_REWARD_STATE_FILE)
+        return True
+    except Exception as exc:
+        log_error(u"Could not save mob reward limits: {0}".format(exc))
+        return False
+
+
+mob_reward_history = _load_mob_reward_history()
+mob_reward_area_history = {}
+mob_reward_warning_until = {}
+
+
+def _mob_spawn_reason(entity):
+    try:
+        reason = entity.getEntitySpawnReason()
+        return str(reason.name()) if reason is not None else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _mob_area_key(location):
+    try:
+        size = MOB_REWARD_AREA_SIZE
+        return (location.getWorld().getUID().toString(),
+                int(location.getX() // size), int(location.getY() // size),
+                int(location.getZ() // size))
+    except Exception:
+        return None
+
+
+def _prune_mob_reward_state(now):
+    for player_uuid, records in list(mob_reward_history.items()):
+        kept = [record for record in records
+                if now - record.get("time", 0.0) <= MOB_BOSS_WINDOW_SECONDS]
+        if kept:
+            mob_reward_history[player_uuid] = kept
+        else:
+            mob_reward_history.pop(player_uuid, None)
+    for area_key, timestamps in list(mob_reward_area_history.items()):
+        kept = [stamp for stamp in timestamps if now - stamp <= MOB_REWARD_WINDOW_SECONDS]
+        if kept:
+            mob_reward_area_history[area_key] = kept
+        else:
+            mob_reward_area_history.pop(area_key, None)
+
+
+def _mob_hourly_total(player_uuid, now):
+    return round(sum([
+        float(record.get("amount", 0.0))
+        for record in mob_reward_history.get(str(player_uuid), [])
+        if now - float(record.get("time", 0.0)) <= MOB_BOSS_WINDOW_SECONDS
+    ]), 2)
+
+
+def _same_type_density(entity, mob_type):
+    try:
+        radius = MOB_REWARD_DENSITY_RADIUS
+        nearby = entity.getWorld().getNearbyEntities(entity.getLocation(), radius, radius, radius)
+        count = 1
+        for other in nearby:
+            try:
+                if other.getUniqueId() != entity.getUniqueId() and str(other.getType().name()) == mob_type:
+                    count += 1
+                    if count >= MOB_REWARD_DENSITY_LIMIT:
+                        return count
+            except Exception:
+                pass
+        return count
+    except Exception:
+        return 1
+
+
+def _mob_reward_allowed(player, entity, mob_type, amount, is_boss, now):
+    spawn_reason = _mob_spawn_reason(entity)
+    player_uuid = str(player.getUniqueId())
+    records = mob_reward_history.get(player_uuid, [])
+    if is_boss:
+        boss_count = len([record for record in records
+                          if record.get("boss") and now - record.get("time", 0.0) <= MOB_BOSS_WINDOW_SECONDS])
+        if boss_count >= MOB_BOSS_LIMIT:
+            return False, u"boss_hour_limit", spawn_reason
+        return True, u"ok", spawn_reason
+
+    if spawn_reason in MOB_NO_REWARD_SPAWN_REASONS:
+        return False, u"spawn_reason=" + to_unicode(spawn_reason), spawn_reason
+
+    if _same_type_density(entity, mob_type) >= MOB_REWARD_DENSITY_LIMIT:
+        return False, u"mob_density", spawn_reason
+
+    recent = [record for record in records
+              if not record.get("boss") and now - record.get("time", 0.0) <= MOB_REWARD_WINDOW_SECONDS]
+    if len(recent) >= MOB_REWARD_KILL_LIMIT:
+        return False, u"player_kill_rate", spawn_reason
+    if recent and sum([float(record.get("amount", 0.0)) for record in recent]) + amount > MOB_REWARD_MONEY_LIMIT:
+        return False, u"player_money_rate", spawn_reason
+
+    area_key = _mob_area_key(entity.getLocation())
+    if area_key is not None and len(mob_reward_area_history.get(area_key, [])) >= MOB_REWARD_AREA_LIMIT:
+        return False, u"area_kill_rate", spawn_reason
+    return True, u"ok", spawn_reason
+
+
+def _warn_mob_reward_blocked(player, reason=None):
+    player_uuid = str(player.getUniqueId())
+    now = time.time()
+    if mob_reward_warning_until.get(player_uuid, 0.0) > now:
+        return
+    mob_reward_warning_until[player_uuid] = now + 15.0
+    try:
+        message = (u"&cЛимит наград за мобов: &f1000$ за последние 60 минут."
+                   if reason == "hourly_money_limit" else
+                   u"&cНаграда не выдана: обнаружена ферма или достигнут временный лимит.")
+        player.sendActionBar(to_java_string(colorize(message)))
+    except Exception:
+        pass
+
+
+def on_mob_death(event):
+    try:
+        entity = event.getEntity()
+        killer = entity.getKiller() if entity is not None else None
+        if killer is None or not isinstance(killer, Player):
+            return
+        mob_type = str(entity.getType().name())
+        reward_data = MOB_REWARDS.get(mob_type)
+        if reward_data is None:
+            return
+
+        minimum, maximum, is_boss = reward_data
+        amount = round(random.uniform(float(minimum), float(maximum)), 2)
+        now = time.time()
+        _prune_mob_reward_state(now)
+        player_uuid = str(killer.getUniqueId())
+        hourly_total = _mob_hourly_total(player_uuid, now)
+        hourly_remaining = round(max(0.0, MOB_REWARD_HOURLY_LIMIT - hourly_total), 2)
+        if hourly_remaining <= 0.0:
+            _warn_mob_reward_blocked(killer, "hourly_money_limit")
+            return
+        original_amount = amount
+        amount = min(amount, hourly_remaining)
+        hourly_clamped = amount < original_amount
+        allowed, reason, spawn_reason = _mob_reward_allowed(
+            killer, entity, mob_type, amount, bool(is_boss), now)
+        if not allowed:
+            _warn_mob_reward_blocked(killer, reason)
+            return
+
+        economy = EconomyManager()
+        success, new_balance = economy.deposit_checked(player_uuid, amount, killer.getName())
+        if not success:
+            log_error(u"Could not credit mob reward to {0}.".format(killer.getName()))
+            return
+
+        mob_reward_history.setdefault(player_uuid, []).append({
+            "time": now, "amount": amount, "boss": bool(is_boss)
+        })
+        _save_mob_reward_history()
+        if not is_boss:
+            area_key = _mob_area_key(entity.getLocation())
+            if area_key is not None:
+                mob_reward_area_history.setdefault(area_key, []).append(now)
+
+        display_name = MOB_DISPLAY_NAMES.get(mob_type, to_unicode(mob_type.replace("_", " ")))
+        log_transaction("MOB_KILL", "SERVER", killer.getName(), amount,
+                        reason=u"{0}; spawn={1}; hourly={2:.2f}/{3:.2f}; clamped={4}".format(
+                            mob_type, spawn_reason, hourly_total + amount,
+                            MOB_REWARD_HOURLY_LIMIT, hourly_clamped),
+                        new_bal_to=new_balance)
+        try:
+            suffix = u" &c(часовой лимит достигнут)" if hourly_clamped else u""
+            killer.sendActionBar(to_java_string(colorize(
+                u"&a+{0} &7за убийство: &f{1}{2}".format(
+                    format_currency(amount), display_name, suffix))))
+        except Exception:
+            killer.sendMessage(to_java_string(colorize(
+                u"&a+{0} &7\u0437\u0430 \u0443\u0431\u0438\u0439\u0441\u0442\u0432\u043e \u043c\u043e\u0431\u0430.".format(format_currency(amount)))))
+    except Exception as exc:
+        log_error(u"Mob reward handler failed: {0}".format(exc))
 
 
 def send_message(recipient, key, **kwargs):
@@ -900,15 +1148,16 @@ class EconomyManager(object):
             return False, False
         if not normalized:
             return False, False
+
         digest_source = u"|".join([
             u"{0}:{1}".format(uuid_key, normalized[uuid_key][0])
             for uuid_key in sorted(normalized.keys())
         ])
         operation_digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
-
         changed_uuids = []
         old_balances = {}
         created_uuids = []
+
         self._lock.acquire()
         try:
             if operation_key in self.processed_operations:
@@ -2206,6 +2455,7 @@ def on_player_quit(event):
             afk_players.pop(uuid_str, None)
             last_activity.pop(uuid_str, None)
             last_location_keys.pop(uuid_str, None)
+            mob_reward_warning_until.pop(uuid_str, None)
             ls_mgr = LastSeenManager()
             ls_mgr.update_last_seen(uuid_str)
             refresh_sleep_rules()
@@ -3013,6 +3263,7 @@ def on_enable():
                 (PlayerMoveEvent, on_player_move),
                 (PlayerInteractEvent, on_player_activity),
                 (PlayerCommandPreprocessEvent, on_player_command),
+                (EntityDeathEvent, on_mob_death),
             ]
             if AsyncPlayerChatEvent is not None:
                 required_events.append((AsyncPlayerChatEvent, on_player_activity))

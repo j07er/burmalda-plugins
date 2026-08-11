@@ -20,6 +20,8 @@ import io
 import time
 import re
 import uuid
+import shutil
+import copy
 
 # Очистка Jython-кэша модулей
 if "contracts" in sys.modules:
@@ -53,6 +55,7 @@ try:
     from org.bukkit.event import Listener, EventPriority
     from org.bukkit.plugin import EventExecutor
     from org.bukkit.event.inventory import InventoryClickEvent, InventoryCloseEvent, InventoryDragEvent
+    from org.bukkit.event.player import PlayerJoinEvent, PlayerQuitEvent
     try:
         from org.bukkit.event.player import AsyncPlayerChatEvent
     except ImportError:
@@ -74,12 +77,15 @@ except ImportError:
     ItemStack = None
 
 try:
-    from java.lang import String as JavaString, System
+    from java.lang import String as JavaString, System, Runnable
+    from java.util import Base64
     JAVA_STRING_AVAILABLE = True
 except ImportError:
     JAVA_STRING_AVAILABLE = False
     JavaString = str
     System = None
+    Runnable = object
+    Base64 = None
 
 
 # -----------------------------------------------------------------------------
@@ -90,6 +96,9 @@ def to_unicode(text):
         return u""
     if isinstance(text, unicode):
         u_text = text
+    elif JAVA_STRING_AVAILABLE and isinstance(text, JavaString):
+        # Bukkit command arguments are native java.lang.String values.
+        u_text = unicode(text)
     elif isinstance(text, str):
         try:
             u_text = text.decode("utf-8")
@@ -99,7 +108,17 @@ def to_unicode(text):
             except Exception:
                 u_text = unicode(text, "utf-8", "ignore")
     else:
-        u_text = unicode(str(text))
+        # Command arguments arrive from Bukkit as java.lang.String objects in
+        # Jython.  Converting those through str() first asks Jython to encode
+        # them as ASCII and crashes on Cyrillic before the command handler is
+        # reached.  unicode(java_string) preserves the original characters.
+        try:
+            u_text = unicode(text)
+        except Exception:
+            try:
+                u_text = unicode(str(text), "utf-8", "replace")
+            except Exception:
+                u_text = u""
 
     if u"\u00d0" in u_text or u"\u00d1" in u_text or u"\u00c3" in u_text:
         try:
@@ -243,18 +262,157 @@ def wrap_text(text, max_len=35, color_prefix=u"  &f"):
 
 class ContractConfig:
     PLUGIN_NAME = u"SmartY-Contracts"
-    VERSION = u"1.0.0"
+    VERSION = u"1.1.0"
     PREFIX = u"&b&l[Контракты]&r "
 
     SCRIPT_DIR = get_script_dir()
     DATA_DIR = os.path.join(SCRIPT_DIR, "data")
     CONTRACTS_FILE = os.path.join(DATA_DIR, "contracts.json")
+    DEFAULT_DEADLINE_HOURS = 72
+    HISTORY_LIMIT = 1000
+    NOTIFICATION_LIMIT = 100
+
+
+class EconomyGateway(object):
+    """Small adapter for the shared economy.py manager."""
+    def __init__(self):
+        self.manager = None
+
+    def refresh(self):
+        self.manager = None
+        if System is not None:
+            try:
+                props = System.getProperties()
+                self.manager = props.get("PySpigot_EconomyManager") or props.get("SmartY_EconomyManager")
+                if self.manager and hasattr(self.manager, "is_active") and not self.manager.is_active():
+                    self.manager = None
+            except Exception:
+                self.manager = None
+        return self.manager
+
+    def withdraw(self, uuid_str, amount):
+        manager = self.refresh()
+        return bool(manager and manager.withdraw(str(uuid_str), float(amount)))
+
+    def deposit(self, uuid_str, amount, name):
+        manager = self.refresh()
+        if not manager:
+            return False
+        if hasattr(manager, "deposit_checked"):
+            result = manager.deposit_checked(str(uuid_str), float(amount), to_unicode(name))
+            return bool(result[0] if isinstance(result, (tuple, list)) else result)
+        manager.deposit(str(uuid_str), float(amount), to_unicode(name))
+        return True
+
+
+def serialize_item(item):
+    if item is None or Base64 is None:
+        return None
+    try:
+        return str(Base64.getEncoder().encodeToString(item.serializeAsBytes()))
+    except Exception as e:
+        log_error(u"Unable to serialize escrow item: {0}".format(e))
+        return None
+
+
+def deserialize_item(encoded):
+    if not encoded or ItemStack is None or Base64 is None:
+        return None
+    try:
+        return ItemStack.deserializeBytes(Base64.getDecoder().decode(str(encoded)))
+    except Exception as e:
+        log_error(u"Unable to deserialize escrow item: {0}".format(e))
+        return None
+
+
+def remove_similar_items(player, sample, amount):
+    """Remove exactly amount matching items, rolling back on a short inventory."""
+    if not player or not sample or amount <= 0:
+        return False
+    inv = player.getInventory()
+    slots = []
+    left = int(amount)
+    for slot in range(inv.getSize()):
+        stack = inv.getItem(slot)
+        if stack and stack.isSimilar(sample):
+            take = min(left, int(stack.getAmount()))
+            slots.append((slot, stack.clone(), take))
+            left -= take
+            if left <= 0:
+                break
+    if left > 0:
+        return False
+    for slot, old_stack, take in slots:
+        new_amount = int(old_stack.getAmount()) - take
+        if new_amount <= 0:
+            inv.setItem(slot, None)
+        else:
+            old_stack.setAmount(new_amount)
+            inv.setItem(slot, old_stack)
+    return True
+
+
+def give_items(player, sample, amount):
+    if not player or not sample or amount <= 0:
+        return False
+    left = int(amount)
+    max_stack = max(1, int(sample.getMaxStackSize()))
+    while left > 0:
+        stack = sample.clone()
+        stack.setAmount(min(max_stack, left))
+        leftovers = player.getInventory().addItem(stack)
+        if leftovers and not leftovers.isEmpty():
+            for dropped in leftovers.values():
+                player.getWorld().dropItemNaturally(player.getLocation(), dropped)
+        left -= int(stack.getAmount())
+    return True
+
+
+def parse_reward_spec(text, player=None):
+    """money <sum>, item <count>, mixed <sum> <count>; item is taken from main hand."""
+    raw = to_unicode(text).strip()
+    parts = raw.replace(u"$", u"").split()
+    money = 0.0
+    item_count = 0
+    kind = parts[0].lower() if parts else u""
+    try:
+        if kind in [u"money", u"деньги"] and len(parts) >= 2:
+            money = float(parts[1].replace(",", "."))
+        elif kind in [u"item", u"предмет"] and len(parts) >= 2:
+            item_count = int(parts[1])
+        elif kind in [u"mixed", u"смешанная"] and len(parts) >= 3:
+            money = float(parts[1].replace(",", "."))
+            item_count = int(parts[2])
+        elif len(parts) == 1:
+            money = float(parts[0].replace(",", "."))
+        else:
+            return {"display": raw, "money": 0.0, "item_count": 0, "item": None}
+    except Exception:
+        return {"display": raw, "money": 0.0, "item_count": 0, "item": None}
+    if money < 0 or item_count < 0 or (money <= 0 and item_count <= 0):
+        raise ValueError("reward must be positive")
+    sample = None
+    if item_count > 0:
+        if player is None:
+            raise ValueError("item escrow requires a player")
+        sample = player.getInventory().getItemInMainHand()
+        if sample is None or (Material is not None and sample.getType() == Material.AIR):
+            raise ValueError("hold the escrow item in main hand")
+        sample = sample.clone()
+        sample.setAmount(1)
+    display = u"{0:.2f}$".format(money) if money > 0 else u""
+    if item_count > 0:
+        item_name = to_unicode(str(sample.getType()))
+        display += (u" + " if display else u"") + u"{0}x {1}".format(item_count, item_name)
+    return {"display": display, "money": money, "item_count": item_count, "item": sample}
 
 
 # -----------------------------------------------------------------------------
 # СТА ТУСЫ И МОДЕЛИ ДАННЫХ (MODELS)
 # -----------------------------------------------------------------------------
 class ContractStatus:
+    DISPUTED = "DISPUTED"
+    OVERDUE = "OVERDUE"
     OPEN = "OPEN"                         # Идет набор кандидатов/исполнителей
     ACTIVE = "ACTIVE"                     # Есть хотя бы один подтвержденный исполнитель
     WAITING_CONFIRMATION = "WAITING_CONFIRMATION"  # Исполнитель отметил работу выполненной
@@ -263,6 +421,10 @@ class ContractStatus:
 
     @staticmethod
     def get_display_name(status):
+        if status == ContractStatus.DISPUTED:
+            return colorize(u"&c&lСПОР")
+        if status == ContractStatus.OVERDUE:
+            return colorize(u"&4&lПРОСРОЧЕН")
         mapping = {
             ContractStatus.OPEN: u"&a&lОТКРЫТ &7(Набор исполнителей)",
             ContractStatus.ACTIVE: u"&e&lВ РАБОТЕ &7(Выполняется)",
@@ -275,7 +437,9 @@ class ContractStatus:
 
 class Contract(object):
     def __init__(self, contract_id, title, description, reward, customer_uuid, customer_name,
-                 max_executors=1, status=ContractStatus.OPEN, candidates=None, executors=None, created_at=None):
+                 max_executors=1, status=ContractStatus.OPEN, candidates=None, executors=None, created_at=None,
+                 reward_money=0.0, reward_item=None, reward_item_count=0, escrow_status="NONE",
+                 deadline_at=None, milestones=None, executor_status=None, dispute=None, ratings=None):
         self.id = str(contract_id)
         self.title = to_unicode(title)
         self.description = to_unicode(description)
@@ -287,6 +451,17 @@ class Contract(object):
         self.candidates = candidates if candidates is not None else []  # [{"uuid": ..., "name": ..., "time": ...}]
         self.executors = executors if executors is not None else []    # [{"uuid": ..., "name": ..., "time": ...}]
         self.created_at = float(created_at) if created_at else time.time()
+        self.reward_money = max(0.0, float(reward_money or 0.0))
+        self.reward_item = reward_item
+        self.reward_item_count = max(0, int(reward_item_count or 0))
+        self.escrow_status = str(escrow_status or "NONE")
+        self.deadline_at = float(deadline_at or (self.created_at + ContractConfig.DEFAULT_DEADLINE_HOURS * 3600))
+        self.milestones = milestones if isinstance(milestones, list) and milestones else [
+            {"id": "1", "title": u"Основная работа", "done_by": []}
+        ]
+        self.executor_status = executor_status if isinstance(executor_status, dict) else {}
+        self.dispute = dispute if isinstance(dispute, dict) else None
+        self.ratings = ratings if isinstance(ratings, list) else []
 
     def is_customer(self, player_uuid):
         return str(player_uuid) == self.customer_uuid
@@ -304,6 +479,11 @@ class Contract(object):
             return True
         return len(self.executors) < self.max_executors
 
+    def all_executors_done(self):
+        return bool(self.executors) and all(
+            self.executor_status.get(e.get("uuid")) == "DONE" for e in self.executors
+        )
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -316,7 +496,16 @@ class Contract(object):
             "status": self.status,
             "candidates": self.candidates,
             "executors": self.executors,
-            "created_at": self.created_at
+            "created_at": self.created_at,
+            "reward_money": self.reward_money,
+            "reward_item": self.reward_item,
+            "reward_item_count": self.reward_item_count,
+            "escrow_status": self.escrow_status,
+            "deadline_at": self.deadline_at,
+            "milestones": self.milestones,
+            "executor_status": self.executor_status,
+            "dispute": self.dispute,
+            "ratings": self.ratings
         }
 
     @classmethod
@@ -332,7 +521,16 @@ class Contract(object):
             status=data.get("status", ContractStatus.OPEN),
             candidates=data.get("candidates", []),
             executors=data.get("executors", []),
-            created_at=data.get("created_at")
+            created_at=data.get("created_at"),
+            reward_money=data.get("reward_money", 0.0),
+            reward_item=data.get("reward_item"),
+            reward_item_count=data.get("reward_item_count", 0),
+            escrow_status=data.get("escrow_status", "NONE"),
+            deadline_at=data.get("deadline_at"),
+            milestones=data.get("milestones"),
+            executor_status=data.get("executor_status", {}),
+            dispute=data.get("dispute"),
+            ratings=data.get("ratings", [])
         )
 
 
@@ -350,20 +548,35 @@ class AtomicFileWriter(object):
                 pass
 
         temp_file = file_path + ".tmp"
+        backup_file = file_path + ".bak"
         try:
-            json_str = json.dumps(data, indent=2, ensure_ascii=False)
+            # Jython 2.7's json encoder can attempt an implicit ASCII encode
+            # when unicode values and byte-string keys are mixed.  Escaped
+            # JSON is semantically identical and avoids that failure entirely.
+            json_str = json.dumps(data, indent=2, ensure_ascii=True)
             if not isinstance(json_str, unicode):
                 json_str = to_unicode(json_str)
 
             with io.open(temp_file, "w", encoding="utf-8") as f:
                 f.write(json_str)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
 
             if os.path.exists(file_path):
                 try:
-                    os.remove(file_path)
+                    shutil.copy2(file_path, backup_file)
                 except Exception:
                     pass
-            os.rename(temp_file, file_path)
+            try:
+                from java.nio.file import Files, Paths, StandardCopyOption
+                Files.move(Paths.get(temp_file), Paths.get(file_path), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            except Exception:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                os.rename(temp_file, file_path)
             return True
         except Exception as e:
             log_error(u"Atomic write error for {0}: {1}".format(file_path, e))
@@ -384,26 +597,41 @@ class StorageManager(object):
             return
         self._initialized = True
         self.file_path = ContractConfig.CONTRACTS_FILE
+        self.history = []
+        self.notifications = {}
+        self.ratings = {}
+        self.last_error = u""
 
     def load_contracts(self):
-        if not os.path.exists(self.file_path):
+        if not os.path.exists(self.file_path) and not os.path.exists(self.file_path + ".bak"):
             return {}
-        try:
-            with io.open(self.file_path, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
+        last_error = None
+        for candidate_path in [self.file_path, self.file_path + ".bak"]:
+            if not os.path.exists(candidate_path):
+                continue
+            try:
+                with io.open(candidate_path, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
                 contracts_dict = {}
                 for cid, cdata in raw_data.get("contracts", {}).items():
                     if isinstance(cdata, dict):
                         contract = Contract.from_dict(cdata)
                         contracts_dict[cid] = contract
+                self.history = raw_data.get("history", []) if isinstance(raw_data.get("history", []), list) else []
+                self.notifications = raw_data.get("notifications", {}) if isinstance(raw_data.get("notifications", {}), dict) else {}
+                self.ratings = raw_data.get("ratings", {}) if isinstance(raw_data.get("ratings", {}), dict) else {}
                 return contracts_dict
-        except Exception as e:
-            log_error(u"Error reading contracts.json: {0}".format(e))
-            return {}
+            except Exception as e:
+                last_error = e
+                log_error(u"Error reading {0}: {1}".format(candidate_path, e))
+        raise IOError("contracts storage and backup are unreadable: {0}".format(last_error))
 
-    def save_contracts(self, contracts_dict):
+    def save_contracts(self, contracts_dict, history=None, notifications=None, ratings=None):
         data = {
-            "contracts": {cid: c.to_dict() for cid, c in contracts_dict.items()}
+            "contracts": {cid: c.to_dict() for cid, c in contracts_dict.items()},
+            "history": history if isinstance(history, list) else self.history,
+            "notifications": notifications if isinstance(notifications, dict) else self.notifications,
+            "ratings": ratings if isinstance(ratings, dict) else self.ratings
         }
         return AtomicFileWriter.write_json(self.file_path, data)
 
@@ -425,35 +653,247 @@ class ContractManager(object):
             return
         self._initialized = True
         self.storage = StorageManager()
+        self.economy = EconomyGateway()
         self.contracts = {}  # contract_id -> Contract
+        self.history = []
+        self.notifications = {}
+        self.ratings = {}
         self.load_all()
 
     def load_all(self):
         self.contracts = self.storage.load_contracts()
+        self.history = self.storage.history
+        self.notifications = self.storage.notifications
+        self.ratings = self.storage.ratings
+        self.mark_overdue()
         log_info(u"Loaded {0} active contracts from storage.".format(len(self.contracts)))
 
     def save_all(self):
-        self.storage.save_contracts(self.contracts)
+        return self.storage.save_contracts(self.contracts, self.history, self.notifications, self.ratings)
 
-    def create_contract(self, customer_uuid, customer_name, title, description, reward, max_executors=1):
+    def create_contract(self, customer_uuid, customer_name, title, description, reward, max_executors=1,
+                        customer_player=None, deadline_hours=None):
+        self.last_error = u""
+        try:
+            reward_info = parse_reward_spec(reward, customer_player)
+        except Exception as e:
+            self.last_error = to_unicode(e)
+            return None
+        money = float(reward_info.get("money", 0.0))
+        item_count = int(reward_info.get("item_count", 0))
+        sample = reward_info.get("item")
+        if money > 0 and not self.economy.withdraw(customer_uuid, money):
+            self.last_error = u"Недостаточно денег или экономика недоступна"
+            return None
+        if item_count > 0 and not remove_similar_items(customer_player, sample, item_count):
+            if money > 0:
+                self.economy.deposit(customer_uuid, money, customer_name)
+            self.last_error = u"Недостаточно предметов, совпадающих с предметом в руке"
+            return None
         cid = "contract_" + str(int(time.time())) + "_" + str(uuid.uuid4())[:8]
+        deadline_hours = float(deadline_hours or ContractConfig.DEFAULT_DEADLINE_HOURS)
+        deadline_hours = max(1.0, min(deadline_hours, 24.0 * 365.0))
         contract = Contract(
             contract_id=cid,
             title=title,
             description=description,
-            reward=reward,
+            reward=reward_info.get("display") or reward,
             customer_uuid=customer_uuid,
             customer_name=customer_name,
             max_executors=max_executors,
-            status=ContractStatus.OPEN
+            status=ContractStatus.OPEN,
+            reward_money=money,
+            reward_item=serialize_item(sample),
+            reward_item_count=item_count,
+            escrow_status="HELD" if money > 0 or item_count > 0 else "NONE",
+            deadline_at=time.time() + deadline_hours * 3600.0
         )
         self.contracts[cid] = contract
-        self.save_all()
+        if not self.save_all():
+            self.contracts.pop(cid, None)
+            if money > 0:
+                self.economy.deposit(customer_uuid, money, customer_name)
+            if item_count > 0:
+                give_items(customer_player, sample, item_count)
+            self.last_error = u"Не удалось сохранить контракт; эскроу возвращён"
+            return None
         log_info(u"Contract created: {0} by {1}".format(title, customer_name))
         return contract
 
+    def notify(self, uuid_str, player_name, text):
+        player = Bukkit.getPlayer(str(player_name)) if BUKKIT_AVAILABLE and player_name else None
+        if player and player.isOnline():
+            send_contract_msg(player, text)
+            return
+        key = str(uuid_str)
+        queue = self.notifications.setdefault(key, [])
+        queue.append({"time": time.time(), "text": to_unicode(text)})
+        if len(queue) > ContractConfig.NOTIFICATION_LIMIT:
+            del queue[:-ContractConfig.NOTIFICATION_LIMIT]
+        self.save_all()
+
+    def deliver_notifications(self, player):
+        key = str(player.getUniqueId())
+        queued = list(self.notifications.get(key, []))
+        if queued:
+            self.notifications.pop(key, None)
+            if not self.save_all():
+                self.notifications[key] = queued
+                send_contract_msg(player, u"&cУведомления пока не выданы: хранилище недоступно.")
+                return
+            send_contract_msg(player, u"&eОфлайн-уведомления по контрактам:")
+            for entry in queued:
+                send_contract_msg(player, entry.get("text", u""))
+
+    def queue_if_offline(self, uuid_str, player_name, text):
+        player = Bukkit.getPlayer(str(player_name)) if BUKKIT_AVAILABLE and player_name else None
+        if player and player.isOnline():
+            return
+        key = str(uuid_str)
+        queue = self.notifications.setdefault(key, [])
+        queue.append({"time": time.time(), "text": to_unicode(text)})
+        if len(queue) > ContractConfig.NOTIFICATION_LIMIT:
+            del queue[:-ContractConfig.NOTIFICATION_LIMIT]
+        self.save_all()
+
+    def mark_overdue(self):
+        changed = False
+        now = time.time()
+        for contract in self.contracts.values():
+            if contract.status in [ContractStatus.OPEN, ContractStatus.ACTIVE] and contract.deadline_at <= now:
+                contract.status = ContractStatus.OVERDUE
+                changed = True
+        if changed:
+            self.save_all()
+
+    def archive(self, contract, final_status):
+        snapshot = contract.to_dict()
+        snapshot["status"] = final_status
+        snapshot["closed_at"] = time.time()
+        self.history.append(snapshot)
+        if len(self.history) > ContractConfig.HISTORY_LIMIT:
+            del self.history[:-ContractConfig.HISTORY_LIMIT]
+
+    def refund_escrow(self, contract, customer_player=None):
+        if contract.escrow_status not in ["HELD", "PAYOUT_FAILED"]:
+            return True
+        if contract.dispute and contract.dispute.get("paid_money"):
+            return False
+        progress = dict(contract.dispute or {})
+        if progress.get("transfer_in_progress"):
+            return False
+        player = customer_player
+        if contract.reward_item_count > 0:
+            if player is None and BUKKIT_AVAILABLE:
+                player = Bukkit.getPlayer(contract.customer_name)
+            if not player or not player.isOnline():
+                return False
+        if contract.reward_money > 0 and not progress.get("refunded_money"):
+            progress["transfer_in_progress"] = {"kind": "refund_money", "uuid": contract.customer_uuid}
+            contract.dispute = progress
+            if not self.save_all():
+                progress.pop("transfer_in_progress", None)
+                return False
+            if not self.economy.deposit(contract.customer_uuid, contract.reward_money, contract.customer_name):
+                progress.pop("transfer_in_progress", None)
+                contract.dispute = progress
+                self.save_all()
+                return False
+            progress["refunded_money"] = True
+            progress.pop("transfer_in_progress", None)
+            contract.dispute = progress
+            if not self.save_all():
+                return False
+        if contract.reward_item_count > 0:
+            if not progress.get("refunded_items"):
+                progress["transfer_in_progress"] = {"kind": "refund_items", "uuid": contract.customer_uuid}
+                contract.dispute = progress
+                if not self.save_all():
+                    progress.pop("transfer_in_progress", None)
+                    return False
+                if not give_items(player, deserialize_item(contract.reward_item), contract.reward_item_count):
+                    progress.pop("transfer_in_progress", None)
+                    contract.dispute = progress
+                    self.save_all()
+                    return False
+                progress["refunded_items"] = True
+                progress.pop("transfer_in_progress", None)
+                contract.dispute = progress
+                if not self.save_all():
+                    return False
+        contract.escrow_status = "REFUNDED"
+        return bool(self.save_all())
+
+    def add_milestone(self, customer, contract_id, title):
+        contract = self.get_contract(contract_id)
+        if not contract or not contract.is_customer(str(customer.getUniqueId())):
+            return False, u"&cКонтракт не найден или вы не заказчик."
+        if contract.status not in [ContractStatus.OPEN, ContractStatus.ACTIVE]:
+            return False, u"&cЭтапы этого контракта уже нельзя менять."
+        next_id = str(max([int(m.get("id", 0)) for m in contract.milestones] + [0]) + 1)
+        contract.milestones.append({"id": next_id, "title": to_unicode(title)[:80], "done_by": []})
+        if not self.save_all():
+            contract.milestones.pop()
+            return False, u"&cОшибка сохранения."
+        return True, u"&aЭтап #{0} добавлен.".format(next_id)
+
+    def mark_milestone_done(self, executor, contract_id, milestone_id):
+        contract = self.get_contract(contract_id)
+        euuid = str(executor.getUniqueId())
+        if not contract or not contract.is_executor(euuid):
+            return False, u"&cВы не исполнитель этого контракта."
+        target = next((m for m in contract.milestones if str(m.get("id")) == str(milestone_id)), None)
+        if not target:
+            return False, u"&cЭтап не найден."
+        if euuid not in target.setdefault("done_by", []):
+            target["done_by"].append(euuid)
+        self.save_all()
+        return True, u"&aЭтап отмечен выполненным."
+
+    def open_dispute(self, player, contract_id, reason):
+        contract = self.get_contract(contract_id)
+        puuid = str(player.getUniqueId())
+        if not contract or (not contract.is_customer(puuid) and not contract.is_executor(puuid)):
+            return False, u"&cВы не участник контракта."
+        contract.status = ContractStatus.DISPUTED
+        contract.dispute = {"opened_by": puuid, "name": to_unicode(player.getName()),
+                            "reason": to_unicode(reason)[:300], "time": time.time()}
+        self.save_all()
+        return True, u"&eСпор открыт. Администратор должен решить судьбу эскроу."
+
+    def rate_player(self, rater, contract_id, target_name, value):
+        record = next((h for h in self.history if h.get("id") == str(contract_id)), None)
+        if not record:
+            return False, u"&cЗавершённый контракт не найден в истории."
+        ruuid = str(rater.getUniqueId())
+        participants = [record.get("customer_uuid")] + [e.get("uuid") for e in record.get("executors", [])]
+        if ruuid not in participants:
+            return False, u"&cОценивать могут только участники сделки."
+        target = next((u for u in participants if u != ruuid and any(
+            to_unicode(x.get("name", u"")).lower() == to_unicode(target_name).lower()
+            for x in ([{"uuid": record.get("customer_uuid"), "name": record.get("customer_name")}]
+                      + record.get("executors", [])) if x.get("uuid") == u)), None)
+        if not target:
+            return False, u"&cУчастник не найден."
+        key = ruuid + ":" + str(contract_id) + ":" + target
+        if key in self.ratings:
+            return False, u"&cВы уже поставили эту оценку."
+        self.ratings[key] = {"contract": str(contract_id), "from": ruuid, "to": target,
+                             "value": max(1, min(5, int(value))), "time": time.time()}
+        self.save_all()
+        return True, u"&aОценка сохранена."
+
     def get_contract(self, contract_id):
-        return self.contracts.get(str(contract_id))
+        lookup = to_unicode(contract_id).strip()
+        direct = self.contracts.get(lookup)
+        if direct is not None:
+            return direct
+        # Player-facing commands may use an exact contract title instead of
+        # the long generated id.  Only accept a unique match so duplicate
+        # titles can never target the wrong escrow.
+        title_matches = [c for c in self.contracts.values()
+                         if to_unicode(c.title).strip().lower() == lookup.lower()]
+        return title_matches[0] if len(title_matches) == 1 else None
 
     def get_all_open_or_active_contracts(self):
         return [c for c in self.contracts.values() if c.status in [ContractStatus.OPEN, ContractStatus.ACTIVE, ContractStatus.WAITING_CONFIRMATION]]
@@ -533,6 +973,7 @@ class ContractManager(object):
             "name": cand_entry["name"],
             "accepted_at": time.time()
         })
+        contract.executor_status[cand_entry["uuid"]] = "ACTIVE"
 
         if contract.status == ContractStatus.OPEN and len(contract.executors) > 0:
             contract.status = ContractStatus.ACTIVE
@@ -597,6 +1038,10 @@ class ContractManager(object):
 
         if exec_entry:
             contract.executors.remove(exec_entry)
+        contract.executor_status.pop(exec_uuid, None)
+        for milestone in contract.milestones:
+            if exec_uuid in milestone.get("done_by", []):
+                milestone["done_by"].remove(exec_uuid)
 
         if len(contract.executors) == 0:
             contract.status = ContractStatus.OPEN
@@ -620,7 +1065,11 @@ class ContractManager(object):
         if not contract.is_executor(exec_uuid):
             return False, u"&cВы не являетесь исполнителем этого контракта!"
 
-        contract.status = ContractStatus.WAITING_CONFIRMATION
+        contract.executor_status[exec_uuid] = "DONE"
+        for milestone in contract.milestones:
+            if exec_uuid not in milestone.setdefault("done_by", []):
+                milestone["done_by"].append(exec_uuid)
+        contract.status = ContractStatus.WAITING_CONFIRMATION if contract.all_executors_done() else ContractStatus.ACTIVE
         self.save_all()
 
         send_to_player_by_name(contract.customer_name, u"&e&lИгрок &f{0} &e&lотметил контракт &f\"{1}\" &e&lкак выполненный! Проверьте и подтвердите через /contract my.".format(
@@ -632,64 +1081,300 @@ class ContractManager(object):
 
         return True, u"&aВы отметите работу как выполненную! Заказчик получил уведомление."
 
-    # --- 6. Подтверждение выполнения заказчиком ---
-    def confirm_completion(self, customer, contract_id):
-        contract = self.get_contract(contract_id)
-        if not contract:
-            return False, u"&cКонтракт не найден!"
-
-        cust_uuid = str(customer.getUniqueId())
-        if not contract.is_customer(cust_uuid):
-            return False, u"&cТолько заказчик может подтверждать выполнение!"
-
-        contract.status = ContractStatus.COMPLETED
-
-        # Удаляем контракт из списка активных в хранилище
-        self.contracts.pop(contract.id, None)
-        self.save_all()
-
-        # Уведомляем всех исполнителей
-        for ex in contract.executors:
-            ename = ex.get("name")
-            send_to_player_by_name(ename, u"&a&lКонтракт &f\"{0}\" &a&lуспешно ЗАВЕРШЕН и закрыт заказчиком! Не забудьте рассчитаться между собой.".format(
-                contract.title
-            ))
-            e_player = Bukkit.getPlayer(ename) if BUKKIT_AVAILABLE else None
-            if e_player:
-                safe_play_sound(e_player, ["ENTITY_PLAYER_LEVELUP", "LEVEL_UP"], 1.0, 1.2)
-
-        return True, u"&aВы успешно подтвердили выполнение контракта &f\"{0}\"&a! Контракт закрыт.".format(contract.title)
-
-    # --- 7. Отмена контракта заказчиком ---
-    def cancel_contract(self, customer, contract_id):
-        contract = self.get_contract(contract_id)
-        if not contract:
-            return False, u"&cКонтракт не найден!"
-
-        cust_uuid = str(customer.getUniqueId())
-        if not contract.is_customer(cust_uuid):
-            return False, u"&cТолько заказчик может отменить контракт!"
-
-        contract.status = ContractStatus.CANCELLED
-        self.contracts.pop(contract.id, None)
-        self.save_all()
-
-        # Уведомляем кандидатов и исполнителей
-        all_notified = set()
-        for c in contract.candidates:
-            all_notified.add(c.get("name"))
-        for e in contract.executors:
-            all_notified.add(e.get("name"))
-
-        for name in all_notified:
-            send_to_player_by_name(name, u"&cЗаказчик отменил контракт &f\"{0}\"&c.".format(contract.title))
-
-        return True, u"&cКонтракт &f\"{0}\" &cбыл отменен.".format(contract.title)
-
-
 # -----------------------------------------------------------------------------
 # GUI LAYER (СУНДУЧНЫЕ ИНВЕНТАРИ, BASE_GUI И МЕНЮ)
 # -----------------------------------------------------------------------------
+    # Escrow settlement and durable immutable archive.
+    def confirm_completion(self, customer, contract_id):
+        contract = self.get_contract(contract_id)
+        if not contract:
+            return False, u"&cКонтракт не найден."
+        if not contract.is_customer(str(customer.getUniqueId())):
+            return False, u"&cТолько заказчик может подтвердить выполнение."
+        if not contract.all_executors_done():
+            return False, u"&cНе все исполнители отметили работу выполненной."
+        executors = list(contract.executors)
+        if not executors:
+            return False, u"&cУ контракта нет исполнителей."
+
+        progress = dict(contract.dispute or {})
+        if progress.get("transfer_in_progress"):
+            return False, u"&cПредыдущая выплата имеет неопределённый результат. Администратор должен использовать /contract resolve <id> paid или retry."
+        if contract.reward_item_count > 0:
+            for ex in executors:
+                target = Bukkit.getPlayer(ex.get("name")) if BUKKIT_AVAILABLE else None
+                if not target or not target.isOnline():
+                    return False, u"&cВсе исполнители должны быть онлайн для выдачи предметного эскроу."
+
+        contract.escrow_status = "PAYOUT_IN_PROGRESS"
+        if not self.save_all():
+            contract.escrow_status = "HELD"
+            return False, u"&cНе удалось подготовить выплату."
+
+        paid_money = list(progress.get("paid_money", []))
+        money_parts = []
+        if contract.reward_money > 0:
+            base_money = round(contract.reward_money / float(len(executors)), 2)
+            money_parts = [base_money for unused in executors]
+            money_parts[-1] = round(money_parts[-1] + contract.reward_money - sum(money_parts), 2)
+        else:
+            money_parts = [0.0 for unused in executors]
+        for index, ex in enumerate(executors):
+            if ex.get("uuid") in paid_money:
+                continue
+            share_money = money_parts[index]
+            if share_money <= 0:
+                continue
+            progress["paid_money"] = list(paid_money)
+            progress["transfer_in_progress"] = {"kind": "money", "uuid": ex.get("uuid"),
+                                                "name": ex.get("name"), "amount": share_money}
+            contract.dispute = progress
+            if not self.save_all():
+                progress.pop("transfer_in_progress", None)
+                return False, u"&cНе удалось зафиксировать начало выплаты."
+            if not self.economy.deposit(ex.get("uuid"), share_money, ex.get("name")):
+                progress.pop("transfer_in_progress", None)
+                contract.escrow_status = "PAYOUT_FAILED"
+                contract.status = ContractStatus.DISPUTED
+                progress["reason"] = u"Ошибка выплаты экономики"
+                progress["time"] = time.time()
+                progress["paid_money"] = paid_money
+                contract.dispute = progress
+                self.save_all()
+                return False, u"&cВыплата остановлена и переведена в спор. Не повторяйте её вручную."
+            paid_money.append(ex.get("uuid"))
+            progress["paid_money"] = list(paid_money)
+            progress.pop("transfer_in_progress", None)
+            contract.dispute = progress
+            if not self.save_all():
+                contract.status = ContractStatus.DISPUTED
+                return False, u"&cВыплата прошла, но её подтверждение не сохранилось. Нужна админ-сверка."
+
+        sample = deserialize_item(contract.reward_item)
+        if contract.reward_item_count > 0 and sample is not None:
+            # Preflight prevents a predictable half-issued item payout.
+            online_targets = []
+            for ex in executors:
+                target = Bukkit.getPlayer(ex.get("name")) if BUKKIT_AVAILABLE else None
+                if not target or not target.isOnline():
+                    contract.escrow_status = "PAYOUT_FAILED"
+                    contract.status = ContractStatus.DISPUTED
+                    contract.dispute = {"reason": u"Исполнитель офлайн во время выдачи предметов",
+                                        "time": time.time(), "paid_money": paid_money}
+                    self.save_all()
+                    return False, u"&cВсе исполнители должны быть онлайн для выдачи предметного эскроу."
+                online_targets.append(target)
+            base = contract.reward_item_count // len(executors)
+            extra = contract.reward_item_count % len(executors)
+            for index, target in enumerate(online_targets):
+                target_uuid = str(target.getUniqueId())
+                paid_items = list(progress.get("paid_items", []))
+                if target_uuid in paid_items:
+                    continue
+                item_amount = base + (1 if index < extra else 0)
+                if item_amount <= 0:
+                    continue
+                progress["transfer_in_progress"] = {"kind": "items", "uuid": target_uuid,
+                                                    "name": target.getName(), "amount": item_amount}
+                contract.dispute = progress
+                if not self.save_all():
+                    progress.pop("transfer_in_progress", None)
+                    return False, u"&cНе удалось зафиксировать начало выдачи предметов."
+                if not give_items(target, sample, item_amount):
+                    progress.pop("transfer_in_progress", None)
+                    contract.status = ContractStatus.DISPUTED
+                    progress["reason"] = u"Ошибка предметной выплаты"
+                    contract.dispute = progress
+                    self.save_all()
+                    return False, u"&cПредметная выплата остановлена и переведена в спор."
+                paid_items.append(target_uuid)
+                progress["paid_items"] = paid_items
+                progress.pop("transfer_in_progress", None)
+                contract.dispute = progress
+                if not self.save_all():
+                    contract.status = ContractStatus.DISPUTED
+                    return False, u"&cПредметы выданы, но подтверждение не сохранилось. Нужна админ-сверка."
+
+        contract.status = ContractStatus.COMPLETED
+        contract.escrow_status = "PAID"
+        self.archive(contract, ContractStatus.COMPLETED)
+        self.contracts.pop(contract.id, None)
+        if not self.save_all():
+            self.contracts[contract.id] = contract
+            return False, u"&cВыплата прошла, но архив не сохранился. Не запускайте выплату повторно."
+        for ex in executors:
+            self.notify(ex.get("uuid"), ex.get("name"),
+                        u"&aКонтракт &f\"{0}\" &aзавершён; награда выплачена из эскроу.".format(contract.title))
+        return True, u"&aКонтракт завершён, награда выплачена, запись добавлена в историю."
+
+    def cancel_contract(self, customer, contract_id):
+        contract = self.get_contract(contract_id)
+        if not contract:
+            return False, u"&cКонтракт не найден."
+        if not contract.is_customer(str(customer.getUniqueId())):
+            return False, u"&cТолько заказчик может отменить контракт."
+        if contract.executors:
+            return False, u"&cАктивный контракт нельзя отменить односторонне. Используйте /contract dispute."
+        if not self.refund_escrow(contract, customer):
+            contract.status = ContractStatus.DISPUTED
+            progress = dict(contract.dispute or {})
+            progress["reason"] = u"Не удалось вернуть эскроу"
+            progress["time"] = time.time()
+            contract.dispute = progress
+            self.save_all()
+            return False, u"&cНе удалось вернуть эскроу; контракт переведён в спор."
+        contract.status = ContractStatus.CANCELLED
+        self.archive(contract, ContractStatus.CANCELLED)
+        self.contracts.pop(contract.id, None)
+        self.save_all()
+        return True, u"&eКонтракт отменён, эскроу возвращён."
+
+    def resolve_dispute(self, admin, contract_id, outcome):
+        if not is_contract_admin(admin):
+            return False, u"&cНет права contracts.admin."
+        contract = self.get_contract(contract_id)
+        if not contract or contract.status != ContractStatus.DISPUTED:
+            return False, u"&cАктивный спор не найден."
+        outcome = str(outcome).lower()
+        if outcome in ["paid", "retry"]:
+            progress = dict(contract.dispute or {})
+            original_progress = copy.deepcopy(progress)
+            transfer = progress.get("transfer_in_progress")
+            if not isinstance(transfer, dict):
+                return False, u"&cУ спора нет неоднозначного перевода для сверки."
+            kind = str(transfer.get("kind", ""))
+            if outcome == "paid":
+                target_uuid = str(transfer.get("uuid"))
+                if kind == "money":
+                    paid = list(progress.get("paid_money", []))
+                    if target_uuid not in paid:
+                        paid.append(target_uuid)
+                    progress["paid_money"] = paid
+                elif kind == "items":
+                    paid = list(progress.get("paid_items", []))
+                    if target_uuid not in paid:
+                        paid.append(target_uuid)
+                    progress["paid_items"] = paid
+                elif kind == "refund_money":
+                    progress["refunded_money"] = True
+                elif kind == "refund_items":
+                    progress["refunded_items"] = True
+            progress.pop("transfer_in_progress", None)
+            contract.dispute = progress
+            if not self.save_all():
+                contract.dispute = original_progress
+                return False, u"&cРешение сверки не удалось сохранить."
+            outcome = "customer" if kind.startswith("refund_") else "executors"
+        if outcome == "customer":
+            if not self.refund_escrow(contract, Bukkit.getPlayer(contract.customer_name) if BUKKIT_AVAILABLE else None):
+                return False, u"&cВозврат невозможен: заказчик с предметным эскроу должен быть онлайн."
+            final_status = ContractStatus.CANCELLED
+        elif outcome == "executors":
+            for ex in contract.executors:
+                contract.executor_status[ex.get("uuid")] = "DONE"
+            contract.status = ContractStatus.WAITING_CONFIRMATION
+            return self.confirm_completion(admin if contract.is_customer(str(admin.getUniqueId())) else _CustomerProxy(contract), contract_id)
+        else:
+            return False, u"&cИспользуйте customer, executors, paid или retry."
+        self.archive(contract, final_status)
+        self.contracts.pop(contract.id, None)
+        self.save_all()
+        return True, u"&aСпор решён в пользу заказчика."
+
+    def admin_mark_all_done(self, admin, contract_id):
+        if not is_contract_admin(admin):
+            return False, u"&cНет права contracts.admin."
+        contract = self.get_contract(contract_id)
+        if not contract:
+            return False, u"&cКонтракт не найден."
+        if not contract.executors:
+            return False, u"&cУ контракта нет исполнителей."
+        progress = contract.dispute if isinstance(contract.dispute, dict) else {}
+        if progress.get("transfer_in_progress"):
+            return False, u"&cСначала выполните ручную сверку незавершённого перевода."
+        for executor in contract.executors:
+            executor_uuid = executor.get("uuid")
+            contract.executor_status[executor_uuid] = "DONE"
+            for milestone in contract.milestones:
+                done_by = milestone.setdefault("done_by", [])
+                if executor_uuid not in done_by:
+                    done_by.append(executor_uuid)
+        contract.status = ContractStatus.WAITING_CONFIRMATION
+        if not self.save_all():
+            return False, u"&cНе удалось сохранить административное подтверждение."
+        log_info(u"Admin {0} marked contract {1} done.".format(admin.getName(), contract.id))
+        return True, u"&aВсе исполнители и этапы отмечены выполненными. Выплата ещё не произведена."
+
+    def admin_confirm_and_pay(self, admin, contract_id):
+        if not is_contract_admin(admin):
+            return False, u"&cНет права contracts.admin."
+        contract = self.get_contract(contract_id)
+        if not contract:
+            return False, u"&cКонтракт не найден."
+        if not contract.all_executors_done():
+            return False, u"&cСначала отметьте выполнение всех исполнителей."
+        result = self.confirm_completion(_CustomerProxy(contract), contract.id)
+        if result[0]:
+            log_info(u"Admin {0} confirmed payout for contract {1}.".format(admin.getName(), contract.id))
+        return result
+
+    def admin_refund_and_close(self, admin, contract_id):
+        if not is_contract_admin(admin):
+            return False, u"&cНет права contracts.admin."
+        contract = self.get_contract(contract_id)
+        if not contract:
+            return False, u"&cКонтракт не найден."
+        progress = contract.dispute if isinstance(contract.dispute, dict) else {}
+        if progress.get("transfer_in_progress") or contract.escrow_status in ["PAYOUT_IN_PROGRESS", "PAID"]:
+            return False, u"&cВозврат заблокирован: сначала выполните ручную сверку незавершённой выплаты."
+        customer = Bukkit.getPlayer(contract.customer_name) if BUKKIT_AVAILABLE else None
+        if not self.refund_escrow(contract, customer):
+            return False, u"&cВозврат не выполнен. Для предметной награды заказчик должен быть в сети; проверьте также незавершённый перевод."
+        contract.status = ContractStatus.CANCELLED
+        self.archive(contract, ContractStatus.CANCELLED)
+        self.contracts.pop(contract.id, None)
+        if not self.save_all():
+            self.contracts[contract.id] = contract
+            return False, u"&cВозврат прошёл, но архив не сохранился. Не повторяйте операцию."
+        log_info(u"Admin {0} refunded and closed contract {1}.".format(admin.getName(), contract.id))
+        return True, u"&aЭскроу возвращено заказчику, контракт закрыт."
+
+    def set_deadline(self, customer, contract_id, hours):
+        contract = self.get_contract(contract_id)
+        if not contract or not contract.is_customer(str(customer.getUniqueId())):
+            return False, u"&cКонтракт не найден или вы не заказчик."
+        if contract.status != ContractStatus.OPEN:
+            return False, u"&cСрок можно менять только до принятия исполнителя."
+        hours = max(1.0, min(float(hours), 24.0 * 365.0))
+        contract.deadline_at = time.time() + hours * 3600.0
+        self.save_all()
+        return True, u"&aСрок контракта установлен: {0:.1f} ч.".format(hours)
+
+    def show_history(self, sender, limit=10):
+        records = list(reversed(self.history[-max(1, min(50, int(limit))):]))
+        if not records:
+            send_contract_msg(sender, u"&7История пока пуста.")
+            return
+        send_contract_msg(sender, u"&eПоследние завершённые контракты:")
+        for record in records:
+            send_contract_msg(sender, u"&7{0} &f{1} &8— &b{2}".format(
+                record.get("id"), record.get("title"), record.get("status")))
+
+
+class _CustomerProxy(object):
+    def __init__(self, contract):
+        self.contract = contract
+    def getUniqueId(self):
+        return self.contract.customer_uuid
+
+
+def is_contract_admin(player):
+    try:
+        return bool(player.isOp() or player.hasPermission("contracts.admin"))
+    except Exception:
+        return False
+
+
 class SmartYInventoryHolder(InventoryHolder):
     def __init__(self, gui_instance):
         self.gui_instance = gui_instance
@@ -790,6 +1475,19 @@ class ContractsMainMenuGUI(BaseGUI):
             item_add.setItemMeta(m_add)
         self.inventory.setItem(16, item_add)
 
+        if is_contract_admin(self.player):
+            admin_item = ItemStack(Material.COMMAND_BLOCK, 1)
+            admin_meta = admin_item.getItemMeta()
+            if admin_meta:
+                admin_meta.setDisplayName(to_java_string(colorize(u"&c&lАдминистрирование контрактов")))
+                admin_meta.setLore([
+                    to_java_string(colorize(u"&7Все действующие контракты и споры.")),
+                    to_java_string(colorize(u"&7Проверка деталей, выполнения и эскроу.")),
+                    to_java_string(colorize(u"&eНажмите, чтобы открыть"))
+                ])
+                admin_item.setItemMeta(admin_meta)
+            self.inventory.setItem(22, admin_item)
+
     def handle_click(self, player, raw_slot, click_type, is_shift):
         if raw_slot == 10:
             gui = ContractsListGUI(player, page=1)
@@ -804,6 +1502,8 @@ class ContractsMainMenuGUI(BaseGUI):
             if hasattr(player, "closeInventory"):
                 player.closeInventory()
             start_contract_creation_wizard(player)
+        elif raw_slot == 22 and is_contract_admin(player):
+            AdminContractsGUI(player, page=1).open(player)
 
 
 # --- 1. Главный список всех контрактов (/contracts) ---
@@ -1093,6 +1793,200 @@ class DoneContractsGUI(BaseGUI):
 
 
 # --- 5. GUI Подробностей контракта & Кнопки действий (ContractDetailsGUI) ---
+def _admin_gui_item(material, name, lore, amount=1):
+    item = ItemStack(material, max(1, min(64, int(amount))))
+    meta = item.getItemMeta()
+    if meta:
+        meta.setDisplayName(to_java_string(colorize(name)))
+        meta.setLore([to_java_string(colorize(line)) for line in lore])
+        item.setItemMeta(meta)
+    return item
+
+
+class AdminContractsGUI(BaseGUI):
+    def __init__(self, player, page=1):
+        super(AdminContractsGUI, self).__init__(u"&4&lАдминистрирование контрактов", rows=6)
+        self.player = player
+        self.page = page
+        self.slot_mapping = {}
+        self.build()
+
+    def build(self):
+        if not self.inventory or not is_contract_admin(self.player):
+            return
+        self.inventory.clear()
+        self.slot_mapping.clear()
+        contracts = list(ContractManager().contracts.values())
+        contracts.sort(key=lambda c: (0 if c.status == ContractStatus.DISPUTED else 1, -c.created_at))
+        per_page = 45
+        max_pages = max(1, (len(contracts) + per_page - 1) // per_page)
+        self.page = max(1, min(self.page, max_pages))
+        start = (self.page - 1) * per_page
+        for slot, contract in enumerate(contracts[start:start + per_page]):
+            material = Material.REDSTONE_TORCH if contract.status == ContractStatus.DISPUTED else Material.PAPER
+            lore = [
+                u"&7ID: &f" + contract.id,
+                u"&7Заказчик: &f" + contract.customer_name,
+                u"&7Награда: &a" + contract.reward,
+                u"&7Эскроу: &f" + to_unicode(contract.escrow_status),
+                u"&7Исполнители: &f{0} &8| &7кандидаты: &f{1}".format(
+                    len(contract.executors), len(contract.candidates)),
+                u"&7Статус: " + ContractStatus.get_display_name(contract.status),
+                u"&eНажмите для полной карточки"
+            ]
+            self.inventory.setItem(slot, _admin_gui_item(material, u"&e&l" + contract.title, lore))
+            self.slot_mapping[slot] = contract.id
+        if self.page > 1:
+            self.inventory.setItem(45, _admin_gui_item(Material.ARROW, u"&aПредыдущая страница", []))
+        self.inventory.setItem(49, _admin_gui_item(Material.BARRIER, u"&cГлавное меню", []))
+        if self.page < max_pages:
+            self.inventory.setItem(53, _admin_gui_item(Material.ARROW, u"&aСледующая страница", []))
+
+    def handle_click(self, player, raw_slot, click_type, is_shift):
+        if not is_contract_admin(player):
+            player.closeInventory()
+            return
+        if raw_slot in self.slot_mapping:
+            AdminContractDetailsGUI(player, self.slot_mapping[raw_slot], self.page).open(player)
+        elif raw_slot == 45 and self.page > 1:
+            AdminContractsGUI(player, self.page - 1).open(player)
+        elif raw_slot == 49:
+            ContractsMainMenuGUI(player).open(player)
+        elif raw_slot == 53:
+            AdminContractsGUI(player, self.page + 1).open(player)
+
+
+class AdminContractDetailsGUI(BaseGUI):
+    def __init__(self, player, contract_id, parent_page=1):
+        super(AdminContractDetailsGUI, self).__init__(u"&4&lАдмин: подробности контракта", rows=6)
+        self.player = player
+        self.contract_id = contract_id
+        self.parent_page = parent_page
+        self.build()
+
+    def build(self):
+        if not self.inventory or not is_contract_admin(self.player):
+            return
+        self.inventory.clear()
+        contract = ContractManager().get_contract(self.contract_id)
+        if not contract:
+            self.inventory.setItem(22, _admin_gui_item(Material.BARRIER, u"&cКонтракт уже закрыт", []))
+            self.inventory.setItem(49, _admin_gui_item(Material.ARROW, u"&eНазад", []))
+            return
+
+        deadline_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(contract.deadline_at))
+        info_lore = [u"&7ID: &f" + contract.id, u"&7Заказчик: &f" + contract.customer_name]
+        info_lore.extend(wrap_text(contract.description, max_len=42, color_prefix=u"&f"))
+        info_lore.extend([
+            u"&7Награда: &a" + contract.reward,
+            u"&7Деньги: &a{0:.2f}$ &8| &7предметов: &f{1}".format(
+                contract.reward_money, contract.reward_item_count),
+            u"&7Эскроу: &f" + to_unicode(contract.escrow_status),
+            u"&7Срок: &f" + to_unicode(deadline_text),
+            u"&7Статус: " + ContractStatus.get_display_name(contract.status)
+        ])
+        self.inventory.setItem(13, _admin_gui_item(Material.WRITTEN_BOOK, u"&e&l" + contract.title, info_lore))
+
+        executor_lore = []
+        for executor in contract.executors:
+            status = contract.executor_status.get(executor.get("uuid"), "WORKING")
+            executor_lore.append(u"&f{0} &7— {1}".format(executor.get("name"), status))
+        if not executor_lore:
+            executor_lore = [u"&8Нет исполнителей"]
+        self.inventory.setItem(10, _admin_gui_item(
+            Material.PLAYER_HEAD, u"&bИсполнители ({0})".format(len(contract.executors)), executor_lore,
+            len(contract.executors) or 1))
+
+        candidate_lore = [u"&f" + to_unicode(c.get("name")) for c in contract.candidates]
+        if not candidate_lore:
+            candidate_lore = [u"&8Нет кандидатов"]
+        self.inventory.setItem(12, _admin_gui_item(
+            Material.NAME_TAG, u"&eКандидаты ({0})".format(len(contract.candidates)), candidate_lore,
+            len(contract.candidates) or 1))
+
+        milestone_lore = []
+        for milestone in contract.milestones:
+            milestone_lore.append(u"&f#{0} {1} &7({2}/{3})".format(
+                milestone.get("id"), milestone.get("title"), len(milestone.get("done_by", [])),
+                len(contract.executors)))
+        self.inventory.setItem(14, _admin_gui_item(
+            Material.OAK_SIGN, u"&6Этапы ({0})".format(len(contract.milestones)),
+            milestone_lore or [u"&8Этапов нет"]))
+
+        dispute = contract.dispute if isinstance(contract.dispute, dict) else {}
+        dispute_lore = [u"&7Открыл: &f" + to_unicode(dispute.get("name", u"—")), u"&7Причина:"]
+        dispute_lore.extend(wrap_text(
+            to_unicode(dispute.get("reason", u"—")), max_len=42, color_prefix=u"&f"))
+        dispute_lore.append(u"&7Денежных долей выдано: &f{0}".format(
+            len(dispute.get("paid_money", []))))
+        dispute_lore.append(u"&7Предметных долей выдано: &f{0}".format(
+            len(dispute.get("paid_items", []))))
+        transfer = dispute.get("transfer_in_progress")
+        if isinstance(transfer, dict):
+            dispute_lore.append(u"&cНезавершённый перевод:")
+            dispute_lore.append(u"&f{0} → {1} ({2})".format(
+                transfer.get("kind", u"?"), transfer.get("name", transfer.get("uuid", u"?")),
+                transfer.get("amount", u"?")))
+        else:
+            dispute_lore.append(u"&7Незавершённый перевод: &aнет")
+        self.inventory.setItem(16, _admin_gui_item(
+            Material.REDSTONE_TORCH, u"&cСпор и журнал выплаты", dispute_lore))
+
+        self.inventory.setItem(29, _admin_gui_item(Material.EMERALD,
+            u"&aОтметить всё выполненным", [u"&7Не выдаёт награду.", u"&7Подтверждает всех исполнителей и этапы."]))
+        self.inventory.setItem(31, _admin_gui_item(Material.DIAMOND_BLOCK,
+            u"&aПодтвердить и выдать награду", [u"&cShift + клик для подтверждения", u"&7Выплата делится между исполнителями."]))
+        self.inventory.setItem(33, _admin_gui_item(Material.REDSTONE_BLOCK,
+            u"&cВернуть эскроу заказчику", [u"&cShift + клик для подтверждения", u"&7Контракт будет закрыт."]))
+
+        if isinstance(dispute.get("transfer_in_progress"), dict):
+            self.inventory.setItem(38, _admin_gui_item(Material.LIME_DYE,
+                u"&aПеревод уже прошёл", [u"&cТолько после ручной сверки!", u"&cShift + клик"]))
+            self.inventory.setItem(42, _admin_gui_item(Material.ORANGE_DYE,
+                u"&6Перевод не прошёл — повторить", [u"&cТолько после ручной сверки!", u"&cShift + клик"]))
+        self.inventory.setItem(49, _admin_gui_item(Material.ARROW, u"&eНазад к списку", []))
+
+    def handle_click(self, player, raw_slot, click_type, is_shift):
+        if not is_contract_admin(player):
+            player.closeInventory()
+            return
+        if raw_slot == 49:
+            AdminContractsGUI(player, self.parent_page).open(player)
+            return
+        manager = ContractManager()
+        contract = manager.get_contract(self.contract_id)
+        if not contract:
+            AdminContractsGUI(player, self.parent_page).open(player)
+            return
+        if raw_slot == 29:
+            success, message = manager.admin_mark_all_done(player, contract.id)
+        elif raw_slot == 31:
+            if not is_shift:
+                send_contract_msg(player, u"&cДля выплаты используйте Shift + клик.")
+                return
+            success, message = manager.admin_confirm_and_pay(player, contract.id)
+        elif raw_slot == 33:
+            if not is_shift:
+                send_contract_msg(player, u"&cДля возврата используйте Shift + клик.")
+                return
+            success, message = manager.admin_refund_and_close(player, contract.id)
+        elif raw_slot in (38, 42):
+            if not is_shift:
+                send_contract_msg(player, u"&cДля сверки перевода используйте Shift + клик.")
+                return
+            success, message = manager.resolve_dispute(
+                player, contract.id, "paid" if raw_slot == 38 else "retry")
+        else:
+            return
+        send_contract_msg(player, message)
+        if success:
+            safe_play_sound(player, ["ENTITY_EXPERIENCE_ORB_PICKUP", "ENTITY_VILLAGER_YES"], 1.0, 1.0)
+        if manager.get_contract(self.contract_id):
+            self.build()
+        else:
+            AdminContractsGUI(player, self.parent_page).open(player)
+
+
 class ContractDetailsGUI(BaseGUI):
     def __init__(self, player, contract_id, parent_gui="contracts"):
         super(ContractDetailsGUI, self).__init__(u"&6&lПодробности контракта", rows=4)
@@ -1376,12 +2270,6 @@ def on_inventory_click(event):
             if clicked_inv == top_inv or (raw_slot >= 0 and raw_slot < top_inv.getSize()):
                 event.setCancelled(True)
 
-                if hasattr(player, "setItemOnCursor") and ItemStack is not None and Material is not None:
-                    try:
-                        player.setItemOnCursor(ItemStack(Material.AIR, 1))
-                    except Exception:
-                        pass
-
                 click_type = str(event.getClick()) if hasattr(event, "getClick") else "LEFT"
                 gui_instance.handle_click(player, raw_slot, click_type, is_shift)
 
@@ -1498,8 +2386,13 @@ def handle_creation_chat_input(player, message):
             title=data["title"],
             description=data["description"],
             reward=data["reward"],
-            max_executors=data["max_executors"]
+            max_executors=data["max_executors"],
+            customer_player=player
         )
+
+        if contract is None:
+            send_contract_msg(player, u"&cКонтракт не создан: {0}".format(mgr.last_error))
+            return True
 
         send_contract_msg(player, u"&a&lКонтракт &f\"{0}\" &a&lуспешно создан и опубликован!".format(contract.title))
         safe_play_sound(player, ["ENTITY_PLAYER_LEVELUP", "LEVEL_UP"], 1.0, 1.2)
@@ -1519,14 +2412,39 @@ def on_player_chat(event):
         p_uuid = str(player.getUniqueId())
         if p_uuid in creation_sessions:
             msg = event.getMessage()
-            if handle_creation_chat_input(player, msg):
-                event.setCancelled(True)
+            event.setCancelled(True)
+            is_async = bool(event.isAsynchronous()) if hasattr(event, "isAsynchronous") else False
+            if is_async:
+                class CreationChatTask(Runnable):
+                    def run(self):
+                        handle_creation_chat_input(player, msg)
+                plugin = get_pyspigot_plugin()
+                if plugin:
+                    Bukkit.getScheduler().runTask(plugin, CreationChatTask())
+                else:
+                    log_error(u"Cannot schedule contract wizard input: PySpigot plugin not found")
+            else:
+                handle_creation_chat_input(player, msg)
     except Exception as e:
         log_error(u"Error in PlayerChatEvent: {0}".format(e))
 
 
 def on_inventory_close(event):
     pass
+
+
+def on_player_join(event):
+    try:
+        ContractManager().deliver_notifications(event.getPlayer())
+    except Exception as e:
+        log_error(u"Error delivering contract notifications: {0}".format(e))
+
+
+def on_player_quit(event):
+    try:
+        creation_sessions.pop(str(event.getPlayer().getUniqueId()), None)
+    except Exception:
+        pass
 
 
 def on_inventory_drag(event):
@@ -1557,6 +2475,17 @@ def parse_cmd_args(*args):
         return sender, [to_unicode(a) for a in last_arg]
 
     return sender, [to_unicode(a) for a in args[1:]]
+
+
+def parse_deadline_hours(value):
+    """Parse a player-entered hour count without relying on JVM locale."""
+    raw = to_unicode(value).strip().replace(u",", u".")
+    if not re.match(u"^[0-9]+(?:[.][0-9]+)?$", raw):
+        raise ValueError("hours must be numeric")
+    hours = float(raw.encode("ascii"))
+    if hours <= 0.0:
+        raise ValueError("hours must be positive")
+    return hours
 
 
 def cmd_contracts(*args):
@@ -1603,7 +2532,18 @@ def cmd_contract_dispatcher(*args):
         gui.open(sender)
         return True
 
+    elif sub in ["admin", "moderate", "moderation"]:
+        if not is_contract_admin(sender):
+            send_contract_msg(sender, u"&cНет права contracts.admin.")
+            return True
+        AdminContractsGUI(sender, page=1).open(sender)
+        return True
+
     elif sub in ["done", "finish"]:
+        if len(cmd_args) >= 2:
+            success, msg = ContractManager().mark_done(sender, cmd_args[1])
+            send_contract_msg(sender, msg)
+            return True
         gui = DoneContractsGUI(sender)
         gui.open(sender)
         return True
@@ -1640,7 +2580,11 @@ def cmd_contract_dispatcher(*args):
         p_name = to_unicode(sender.getName())
 
         mgr = ContractManager()
-        contract = mgr.create_contract(p_uuid, p_name, title, desc, reward, max_exec)
+        contract = mgr.create_contract(p_uuid, p_name, title, desc, reward, max_exec, customer_player=sender)
+
+        if contract is None:
+            send_contract_msg(sender, u"&cКонтракт не создан: {0}".format(mgr.last_error))
+            return True
 
         send_contract_msg(sender, u"&a&lКонтракт &f\"{0}\" &a&lуспешно создан!".format(title))
         safe_play_sound(sender, ["ENTITY_PLAYER_LEVELUP", "LEVEL_UP"], 1.0, 1.2)
@@ -1667,6 +2611,48 @@ def cmd_contract_dispatcher(*args):
         send_contract_msg(sender, msg)
         return True
 
+    elif sub == "deadline" and len(cmd_args) >= 3:
+        try:
+            hours = parse_deadline_hours(cmd_args[2])
+            success, msg = ContractManager().set_deadline(sender, cmd_args[1], hours)
+        except (ValueError, TypeError):
+            success, msg = False, u"&cКоличество часов должно быть числом."
+        send_contract_msg(sender, msg)
+        return True
+
+    elif sub == "milestone" and len(cmd_args) >= 4:
+        action = cmd_args[1].lower()
+        if action == "add":
+            success, msg = ContractManager().add_milestone(sender, cmd_args[2], u" ".join(cmd_args[3:]))
+        elif action == "done":
+            success, msg = ContractManager().mark_milestone_done(sender, cmd_args[2], cmd_args[3])
+        else:
+            success, msg = False, u"&cИспользуйте milestone add|done."
+        send_contract_msg(sender, msg)
+        return True
+
+    elif sub == "dispute" and len(cmd_args) >= 3:
+        success, msg = ContractManager().open_dispute(sender, cmd_args[1], u" ".join(cmd_args[2:]))
+        send_contract_msg(sender, msg)
+        return True
+
+    elif sub == "resolve" and len(cmd_args) >= 3:
+        success, msg = ContractManager().resolve_dispute(sender, cmd_args[1], cmd_args[2])
+        send_contract_msg(sender, msg)
+        return True
+
+    elif sub == "rate" and len(cmd_args) >= 4:
+        try:
+            success, msg = ContractManager().rate_player(sender, cmd_args[1], cmd_args[2], int(cmd_args[3]))
+        except ValueError:
+            success, msg = False, u"&cОценка должна быть от 1 до 5."
+        send_contract_msg(sender, msg)
+        return True
+
+    elif sub == "history":
+        ContractManager().show_history(sender, int(cmd_args[1]) if len(cmd_args) > 1 and cmd_args[1].isdigit() else 10)
+        return True
+
     else:
         send_contract_msg(sender, u"&cНеизвестная подкоманда! Доступно:")
         send_contract_msg(sender, u"&e/contracts &7— Все открытые контракты")
@@ -1674,6 +2660,14 @@ def cmd_contract_dispatcher(*args):
         send_contract_msg(sender, u"&e/contract my &7— Мои созданные контракты")
         send_contract_msg(sender, u"&e/contract active &7— Мои контракты (где я исполнитель)")
         send_contract_msg(sender, u"&e/contract done &7— Сдать работу за выполнение")
+        send_contract_msg(sender, u"&e/contract deadline <id> <часы> &7— срок исполнения")
+        send_contract_msg(sender, u"&e/contract milestone <add|done> <id> ... &7— этапы")
+        send_contract_msg(sender, u"&e/contract dispute <id> <причина> &7— открыть спор")
+        send_contract_msg(sender, u"&e/contract rate <id> <игрок> <1-5> &7— оценка участника")
+        send_contract_msg(sender, u"&e/contract history [лимит] &7— архив сделок")
+        if is_contract_admin(sender):
+            send_contract_msg(sender, u"&e/contract admin &7— административная панель контрактов")
+            send_contract_msg(sender, u"&e/contract resolve <id> <customer|executors|paid|retry> &7— решить спор/сверить перевод")
         return True
 
 
@@ -1700,7 +2694,10 @@ if BUKKIT_AVAILABLE:
 
         def tabComplete(self, sender, alias, args):
             try:
-                subcommands = ["create", "add", "my", "active", "done", "cancel"]
+                subcommands = ["create", "add", "my", "active", "done", "cancel", "deadline",
+                               "milestone", "dispute", "resolve", "rate", "history"]
+                if is_contract_admin(sender):
+                    subcommands.append("admin")
                 if not args or len(args) <= 1:
                     prefix = str(args[0]).lower() if args and len(args) > 0 else ""
                     matched = [s for s in subcommands if s.startswith(prefix)]
@@ -1965,6 +2962,8 @@ def on_enable():
             register_event_directly(InventoryClickEvent, on_inventory_click)
             register_event_directly(InventoryCloseEvent, on_inventory_close)
             register_event_directly(InventoryDragEvent, on_inventory_drag)
+            register_event_directly(PlayerJoinEvent, on_player_join)
+            register_event_directly(PlayerQuitEvent, on_player_quit)
             if AsyncPlayerChatEvent is not None:
                 register_event_directly(AsyncPlayerChatEvent, on_player_chat)
             elif PlayerChatEvent is not None:

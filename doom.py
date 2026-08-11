@@ -8,7 +8,7 @@
   Commands:
     /test doom             — give kit (Monarch Scepter, tier I)
     /doom <ability>        — abilities (require Doom sword in inventory)
-        дезинтегратор | левитация | репульсор | цепи | ремонт | ульт
+        дезинтегратор | левитация | репульсор | рой | цепи | ремонт | ульт
 ------------------------------------------------------------------------------
   Testing account (no cooldowns): blueredtronce
 ==============================================================================
@@ -62,19 +62,14 @@ FREE_CD_PLAYERS = set([u"blueredtronce"])
 KEY_SWORD  = NamespacedKey.fromString("doomlord:sword")
 KEY_TIER   = NamespacedKey.fromString("doomlord:tier")
 
-# CDs (ticks).
-# Ребаланс от 2026-07-28: КД Репульсора и Дезинтегратора сокращены ~в 3 раза.
-# Причина: тесты показали урон 3 HP (Репульсор) и 4 HP (Дезинтегратор) при
-# ожидании 6-10 и 10-16 соответственно. Вместо повышения урона (что дало бы
-# ваншот-магию) увеличиваем DPS через частоту применения: персонаж становится
-# активным "давящим" бойцом с постоянным техно-прессингом, а не разовыми
-# крупными хитами.
-CD_DISINT   = 8 * 20      # было 25 сек -> 8 сек (~3x чаще)
+# CDs (ticks). Current character balance.
+CD_DISINT   = 25 * 20
 CD_FLIGHT   = 45 * 20
-CD_REPULSOR = 7 * 20      # было 20 сек -> 7 сек (~3x чаще)
+CD_REPULSOR = 15 * 20
 CD_CHAINS   = 35 * 20
 CD_REPAIR   = 60 * 20
 CD_ULT      = 4 * 60 * 20
+CD_NANO_SWARM = 35 * 20
 
 FLIGHT_DURATION = 15 * 20
 ULT_BUFF_DUR    = 15 * 20
@@ -105,6 +100,7 @@ E_ABSORPTION  = _effect("absorption")
 E_MINING_FTG  = _effect("mining_fatigue")
 E_NAUSEA      = _effect("nausea")
 E_DARKNESS    = _effect("darkness")
+E_GLOWING     = _effect("glowing")
 
 ENC_SHARPNESS     = _enchant("sharpness")
 ENC_FIRE_ASPECT   = _enchant("fire_aspect")
@@ -119,6 +115,7 @@ cooldowns    = {}   # uid -> {ability: end_tick}
 flight_end   = {}   # uid -> tick when flight expires
 repair_lock  = set()
 ult_active   = set()
+nano_swarms  = {}   # owner UUID -> active swarm state
 
 # Progression: uid -> {"mobs": int, "players": int}
 progress = {}
@@ -521,6 +518,54 @@ def ability_repulsor(player):
     set_cd(player, "repulsor", CD_REPULSOR)
 
 
+def ability_nano_swarm(player):
+    """Ten-second close-range swarm: normal (armor-reduced) damage only."""
+    if not check_cd(player, "nano", u"«Нано-Рой»"):
+        return
+    owner_id = uid(player)
+    if owner_id in nano_swarms:
+        player.sendMessage(u"§7Нано-рой уже активен.")
+        return
+
+    state = {"pulses": 0, "max_pulses": 5}
+    nano_swarms[owner_id] = state
+    world = player.getWorld()
+    world.playSound(player.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, 0.7, 1.7)
+    player.sendMessage(u"§b✦ Нано-рой активирован. §7Радиус: §f6§7 блоков, время: §f10§7 сек.")
+
+    def swarm_pulse():
+        if not player.isOnline() or nano_swarms.get(owner_id) is not state:
+            nano_swarms.pop(owner_id, None)
+            return
+        if state["pulses"] >= state["max_pulses"]:
+            nano_swarms.pop(owner_id, None)
+            player.getWorld().playSound(player.getLocation(), Sound.BLOCK_BEACON_DEACTIVATE, 0.5, 1.5)
+            return
+
+        current_world = player.getWorld()
+        center = player.getLocation().add(0, 1.0, 0)
+        current_world.spawnParticle(Particle.ELECTRIC_SPARK, center, 36, 3.0, 1.3, 3.0, 0.12)
+        for target in current_world.getNearbyEntities(player.getLocation(), 6.0, 6.0, 6.0):
+            if not isinstance(target, LivingEntity):
+                continue
+            if target.getUniqueId().equals(player.getUniqueId()):
+                continue
+            try:
+                if target.isDead() or not target.isValid() or target.getType() == EntityType.ARMOR_STAND:
+                    continue
+                # Vanilla damage: armour and normal defensive mechanics apply.
+                target.damage(1.0, player)  # 0.5 heart; five pulses = at most 2.5 hearts.
+                # The final refresh at 8 seconds expires exactly at 10 seconds.
+                add_effect(target, E_GLOWING, 40, 0, ambient=True, particles=False)
+            except Exception:
+                pass
+        state["pulses"] += 1
+        scheduler.runTaskLater(swarm_pulse, 2 * 20)
+
+    swarm_pulse()
+    set_cd(player, "nano", CD_NANO_SWARM)
+
+
 def ability_flight(player):
     if not check_cd(player, "flight", u"«Реактивная Левитация»"):
         return
@@ -655,8 +700,8 @@ def ability_ultimate(player):
             continue
         if e.getUniqueId().equals(player.getUniqueId()):
             continue
-        add_effect(e, E_SLOWNESS,   8 * 20, 0)
-        add_effect(e, E_MINING_FTG, 8 * 20, 0)
+        add_effect(e, E_SLOWNESS,   15 * 20, 0)
+        add_effect(e, E_MINING_FTG, 15 * 20, 0)
         add_effect(e, E_DARKNESS,   8 * 20, 0)
         enemies_hit += 1
 
@@ -867,6 +912,8 @@ def cmd_doom(sender, label, args):
         ability_flight(sender)
     elif ability in (u"репульсор", u"repulsor", u"импульс"):
         ability_repulsor(sender)
+    elif ability in (u"рой", u"нанорой", u"нано-рой", u"nano", u"swarm"):
+        ability_nano_swarm(sender)
     elif ability in (u"цепи", u"chains", u"chain"):
         ability_chains(sender)
     elif ability in (u"ремонт", u"repair", u"авторемонт"):
@@ -875,7 +922,7 @@ def cmd_doom(sender, label, args):
         ability_ultimate(sender)
     else:
         sender.sendMessage(u"§cНеизвестная способность: §f" + ability)
-        sender.sendMessage(u"§7Доступно: §fдезинтегратор§7, §fлевитация§7, §fрепульсор§7, §fцепи§7, §fремонт§7, §fульт§7.")
+        sender.sendMessage(u"§7Доступно: §fдезинтегратор§7, §fлевитация§7, §fрепульсор§7, §fрой§7, §fцепи§7, §fремонт§7, §fульт§7.")
 
     return True
 
@@ -967,15 +1014,7 @@ _tier_reg.put("doom", _doom_set_tier)
 
 # --- Публикация особых предметов в каталог Зеркала Души Арчера ---
 def _doom_mirror_sword(owner_uuid):
-    # I тир Дума — каменный меч + Sharpness II.
-    # Арчер сам обернёт результат через свой sanitize и повесит TTL/kind=mirror.
-    it = ItemStack(Material.STONE_SWORD, 1)
-    meta = it.getItemMeta()
-    meta.setDisplayName(u"§cМонарший Скипетр")
-    if ENC_SHARPNESS is not None:
-        meta.addEnchant(ENC_SHARPNESS, 2, True)
-    it.setItemMeta(meta)
-    return it
+    return create_doom_sword(2)
 
 _MIRROR_CATALOG_KEY = "archer.mirror_catalog"
 _mirror_cat = _props.get(_MIRROR_CATALOG_KEY)

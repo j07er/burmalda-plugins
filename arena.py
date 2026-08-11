@@ -22,6 +22,7 @@ import sys
 import json
 import time
 import re
+import shutil
 
 # Совместимость unicode в Python 2 (Jython) и Python 3
 try:
@@ -305,6 +306,10 @@ class ArenaConfig:
     ARENA_FILE = os.path.join(DATA_DIR, "arena.json")
     PLAYERS_FILE = os.path.join(DATA_DIR, "players.json")
     REQUEST_TIMEOUT = 30
+    FIGHT_TIMEOUT_SECONDS = 10 * 60
+    ARENA_RADIUS = 35.0
+    ARENA_VERTICAL_LIMIT = 20.0
+    HISTORY_LIMIT = 500
 
     MESSAGES = {
         "request_sent": u"{prefix}&7Вы вызвали игрока &e{target} &7на дуэль со ставкой &a{bet}&7!",
@@ -427,6 +432,27 @@ def get_economy_manager():
         if hasattr(mod, "EconomyManager"):
             return mod.EconomyManager()
     return None
+
+
+def economy_deposit_checked(economy, uuid_str, amount, name=None):
+    """Return True only when the economy explicitly confirms a deposit."""
+    if economy is None or float(amount) <= 0:
+        return False
+    try:
+        if hasattr(economy, "deposit_checked"):
+            result = economy.deposit_checked(uuid_str, float(amount), name)
+            try:
+                return bool(result[0])
+            except Exception:
+                return bool(result)
+        before = economy.get_balance(uuid_str) if hasattr(economy, "get_balance") else None
+        economy.deposit(uuid_str, float(amount), name)
+        if before is not None and hasattr(economy, "get_balance"):
+            return float(economy.get_balance(uuid_str)) >= float(before) + float(amount) - 0.005
+        return True
+    except Exception as exc:
+        log_error(u"Economy deposit failed for {0}: {1}".format(uuid_str, exc))
+        return False
 
 
 def get_sender_uuid_and_name(sender):
@@ -566,10 +592,24 @@ class PlayerStatsManager(object):
             temp_file = ArenaConfig.PLAYERS_FILE + ".tmp"
             with open(temp_file, "w") as f:
                 json.dump(data_to_write, f, indent=2, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
 
             if os.path.exists(ArenaConfig.PLAYERS_FILE):
-                os.remove(ArenaConfig.PLAYERS_FILE)
-            os.rename(temp_file, ArenaConfig.PLAYERS_FILE)
+                try:
+                    shutil.copy2(ArenaConfig.PLAYERS_FILE, ArenaConfig.PLAYERS_FILE + ".bak")
+                except Exception:
+                    pass
+            try:
+                from java.nio.file import Files, Paths, StandardCopyOption
+                Files.move(Paths.get(temp_file), Paths.get(ArenaConfig.PLAYERS_FILE), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            except Exception:
+                if os.path.exists(ArenaConfig.PLAYERS_FILE):
+                    os.remove(ArenaConfig.PLAYERS_FILE)
+                os.rename(temp_file, ArenaConfig.PLAYERS_FILE)
         except Exception as e:
             log_error(u"Error saving players.json: {0}".format(e))
 
@@ -631,6 +671,8 @@ class ArenaDataManager(object):
             return
         self._initialized = True
         self.spawns = {"p1": None, "p2": None, "spectator": None}
+        self.match_history = []
+        self.pending_settlements = {}
         self.load_data()
 
     def load_data(self):
@@ -646,6 +688,8 @@ class ArenaDataManager(object):
             with open(ArenaConfig.ARENA_FILE, "r") as f:
                 data = json.load(f)
                 self.spawns = data.get("spawns", self.spawns)
+                self.match_history = data.get("match_history", []) if isinstance(data.get("match_history", []), list) else []
+                self.pending_settlements = data.get("pending_settlements", {}) if isinstance(data.get("pending_settlements", {}), dict) else {}
         except Exception as e:
             log_error(u"Error reading arena.json: {0}".format(e))
 
@@ -653,10 +697,32 @@ class ArenaDataManager(object):
         try:
             if not os.path.exists(ArenaConfig.DATA_DIR):
                 os.makedirs(ArenaConfig.DATA_DIR)
-            with open(ArenaConfig.ARENA_FILE, "w") as f:
-                json.dump({"spawns": self.spawns}, f, indent=2, ensure_ascii=False)
+            data = {"spawns": self.spawns, "match_history": self.match_history[-ArenaConfig.HISTORY_LIMIT:],
+                    "pending_settlements": self.pending_settlements}
+            temp_file = ArenaConfig.ARENA_FILE + ".tmp"
+            if os.path.exists(ArenaConfig.ARENA_FILE):
+                try:
+                    shutil.copy2(ArenaConfig.ARENA_FILE, ArenaConfig.ARENA_FILE + ".bak")
+                except Exception:
+                    pass
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            try:
+                from java.nio.file import Files, Paths, StandardCopyOption
+                Files.move(Paths.get(temp_file), Paths.get(ArenaConfig.ARENA_FILE), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            except Exception:
+                if os.path.exists(ArenaConfig.ARENA_FILE):
+                    os.remove(ArenaConfig.ARENA_FILE)
+                os.rename(temp_file, ArenaConfig.ARENA_FILE)
+            return True
         except Exception as e:
             log_error(u"Error saving arena.json: {0}".format(e))
+            return False
 
     def set_spawn(self, point, location):
         if not BUKKIT_AVAILABLE or not location:
@@ -708,7 +774,15 @@ def save_player_state(player):
         "saturation": player.getSaturation(),
         "exp": player.getTotalExperience(),
         "level": player.getLevel(),
-        "potions": potion_effects
+        "exp_progress": player.getExp(),
+        "potions": potion_effects,
+        "game_mode": player.getGameMode(),
+        "allow_flight": player.getAllowFlight(),
+        "flying": player.isFlying(),
+        "fire_ticks": player.getFireTicks(),
+        "absorption": player.getAbsorptionAmount() if hasattr(player, "getAbsorptionAmount") else 0.0,
+        "held_slot": inv.getHeldItemSlot(),
+        "velocity": player.getVelocity().clone() if hasattr(player.getVelocity(), "clone") else player.getVelocity()
     }
     log_info(u"Saved pre-duel state for player {0} at location {1},{2},{3}".format(
         player.getName(), int(loc.getX()), int(loc.getY()), int(loc.getZ())
@@ -746,9 +820,7 @@ def restore_player_state(player):
             if not res:
                 return False
 
-        player_states.pop(uuid_str, None)
-
-        player.setHealth(max(1.0, player.getMaxHealth()))
+        player.setHealth(max(1.0, min(player.getMaxHealth(), float(st.get("health", player.getMaxHealth())))))
         player.setFoodLevel(st.get("food", 20))
         player.setSaturation(st.get("saturation", 5.0))
 
@@ -770,6 +842,20 @@ def restore_player_state(player):
             player.addPotionEffect(p_effect)
 
         player.setLevel(st.get("level", 0))
+        if hasattr(player, "setTotalExperience"):
+            player.setTotalExperience(int(st.get("exp", 0)))
+        if hasattr(player, "setExp"):
+            player.setExp(float(st.get("exp_progress", 0.0)))
+        if st.get("game_mode") is not None:
+            player.setGameMode(st.get("game_mode"))
+        player.setAllowFlight(bool(st.get("allow_flight", False)))
+        player.setFlying(bool(st.get("flying", False)) and bool(st.get("allow_flight", False)))
+        player.setFireTicks(int(st.get("fire_ticks", 0)))
+        if hasattr(player, "setAbsorptionAmount"):
+            player.setAbsorptionAmount(float(st.get("absorption", 0.0)))
+        inv.setHeldItemSlot(int(st.get("held_slot", 0)))
+        if st.get("velocity") is not None:
+            player.setVelocity(st.get("velocity"))
 
         try:
             if "economy" in sys.modules:
@@ -779,6 +865,7 @@ def restore_player_state(player):
         except:
             pass
 
+        player_states.pop(uuid_str, None)
         return True
 
     except Exception as e:
@@ -867,7 +954,35 @@ def start_arena_duel(p1, p2, bet):
 
     if not p1_player or not p2_player:
         log_error(u"Could not find Bukkit Player objects for duel start.")
-        return
+        return False
+
+    arena_mgr = ArenaDataManager()
+    pre_loc1 = arena_mgr.get_spawn_location("p1")
+    pre_loc2 = arena_mgr.get_spawn_location("p2")
+    if not pre_loc1 or not pre_loc2:
+        send_arena_msg(p1_player, u"{prefix}&cТочки арены p1/p2 не настроены. Бой не начат.")
+        send_arena_msg(p2_player, u"{prefix}&cТочки арены p1/p2 не настроены. Бой не начат.")
+        return False
+    if pre_loc1.getWorld() != pre_loc2.getWorld():
+        send_arena_msg(p1_player, u"{prefix}&cТочки p1 и p2 находятся в разных мирах. Бой не начат.")
+        send_arena_msg(p2_player, u"{prefix}&cТочки p1 и p2 находятся в разных мирах. Бой не начат.")
+        return False
+
+    eco = get_economy_manager()
+    escrow_total = 0.0
+    if float(bet) > 0:
+        if not eco:
+            send_arena_msg(p1_player, u"{prefix}&cЭкономика недоступна; бой со ставкой не начат.")
+            send_arena_msg(p2_player, u"{prefix}&cЭкономика недоступна; бой со ставкой не начат.")
+            return False
+        if not eco.withdraw(p1_uuid, float(bet)):
+            send_arena_msg(p1_player, "insufficient_funds_sender", bet=format_currency(bet))
+            return False
+        if not eco.withdraw(p2_uuid, float(bet)):
+            economy_deposit_checked(eco, p1_uuid, float(bet), p1_name)
+            send_arena_msg(p2_player, "insufficient_funds_sender", bet=format_currency(bet))
+            return False
+        escrow_total = float(bet) * 2.0
 
     duel_id = "{0}_vs_{1}_{2}".format(p1_uuid, p2_uuid, int(time.time()))
     active_duels[duel_id] = {
@@ -876,7 +991,10 @@ def start_arena_duel(p1, p2, bet):
         "p1_name": p1_name,
         "p2_name": p2_name,
         "bet": float(bet),
-        "state": "COUNTDOWN"
+        "escrow_total": escrow_total,
+        "state": "COUNTDOWN",
+        "started_at": time.time(),
+        "settled": False
     }
 
     save_player_state(p1_player)
@@ -893,8 +1011,18 @@ def start_arena_duel(p1, p2, bet):
         send_arena_msg(p1_player, u"{prefix}&cВнимание: Точки спавна арены (p1/p2) не установлены! Установите их: &f/arena setspawn p1 &cи &f/arena setspawn p2")
         send_arena_msg(p2_player, u"{prefix}&cВнимание: Точки спавна арены (p1/p2) не установлены! Установите их: &f/arena setspawn p1 &cи &f/arena setspawn p2")
     else:
-        p1_player.teleport(loc1)
-        p2_player.teleport(loc2)
+        teleport1 = p1_player.teleport(loc1)
+        teleport2 = p2_player.teleport(loc2)
+        if not teleport1 or not teleport2:
+            active_duels.pop(duel_id, None)
+            frozen_players.discard(p1_uuid)
+            frozen_players.discard(p2_uuid)
+            if escrow_total > 0:
+                economy_deposit_checked(eco, p1_uuid, float(bet), p1_name)
+                economy_deposit_checked(eco, p2_uuid, float(bet), p2_name)
+            schedule_restore_player(p1_player, 1, 10)
+            schedule_restore_player(p2_player, 1, 10)
+            return False
 
     p1_player.setHealth(p1_player.getMaxHealth())
     p1_player.setFoodLevel(20)
@@ -906,7 +1034,7 @@ def start_arena_duel(p1, p2, bet):
         frozen_players.discard(p1_uuid)
         frozen_players.discard(p2_uuid)
         active_duels[duel_id]["state"] = "FIGHT"
-        return
+        return True
 
     class CountdownRunnable(Runnable):
         def __init__(self):
@@ -967,6 +1095,61 @@ def start_arena_duel(p1, p2, bet):
         frozen_players.discard(p2_uuid)
         active_duels[duel_id]["state"] = "FIGHT"
 
+    schedule_duel_timeout(duel_id)
+    return True
+
+
+def schedule_duel_timeout(duel_id):
+    plugin = get_pyspigot_plugin()
+    if not plugin or not BUKKIT_AVAILABLE:
+        return
+
+    class DuelTimeoutRunnable(Runnable):
+        def run(self):
+            duel = active_duels.get(duel_id)
+            if not duel:
+                return
+            p1 = get_online_player_by_uuid_or_name(duel.get("p1_uuid"), duel.get("p1_name"))
+            p2 = get_online_player_by_uuid_or_name(duel.get("p2_uuid"), duel.get("p2_name"))
+            if p1 and p2:
+                h1 = float(p1.getHealth())
+                h2 = float(p2.getHealth())
+                if abs(h1 - h2) > 0.01:
+                    winner = duel.get("p1_uuid") if h1 > h2 else duel.get("p2_uuid")
+                    loser = duel.get("p2_uuid") if winner == duel.get("p1_uuid") else duel.get("p1_uuid")
+                    finish_arena_duel(duel_id, winner_uuid=winner, loser_uuid=loser)
+                    return
+            cancel_arena_duel(duel_id, u"Лимит времени истёк: ничья, ставки возвращены.")
+
+    Bukkit.getScheduler().runTaskLater(plugin, DuelTimeoutRunnable(), int(ArenaConfig.FIGHT_TIMEOUT_SECONDS * 20))
+
+
+def cancel_arena_duel(duel_id, reason=u"Бой отменён"):
+    duel = active_duels.pop(duel_id, None)
+    if not duel:
+        return
+    p1_uuid, p2_uuid = duel.get("p1_uuid"), duel.get("p2_uuid")
+    frozen_players.discard(p1_uuid)
+    frozen_players.discard(p2_uuid)
+    eco = get_economy_manager()
+    bet = float(duel.get("bet", 0.0))
+    if bet > 0 and float(duel.get("escrow_total", 0.0)) > 0:
+        data_mgr = ArenaDataManager()
+        for puuid, pname in [(p1_uuid, duel.get("p1_name")), (p2_uuid, duel.get("p2_name"))]:
+            if not economy_deposit_checked(eco, puuid, bet, pname):
+                refund_id = duel_id + ":refund:" + str(puuid)
+                data_mgr.pending_settlements[refund_id] = {
+                    "duel_id": duel_id, "kind": "REFUND", "recipient_uuid": puuid,
+                    "recipient_name": pname, "amount": bet, "status": "PENDING",
+                    "time": time.time(), "reason": to_unicode(reason)
+                }
+        data_mgr.save_data()
+    for puuid, pname in [(p1_uuid, duel.get("p1_name")), (p2_uuid, duel.get("p2_name"))]:
+        player = get_online_player_by_uuid_or_name(puuid, pname)
+        if player:
+            send_arena_msg(player, u"{prefix}&e" + to_unicode(reason))
+            schedule_restore_player(player, 1, 20)
+
 
 def finish_arena_duel(duel_id, winner_uuid=None, loser_uuid=None, leaver_uuid=None):
     if duel_id not in active_duels:
@@ -1004,17 +1187,37 @@ def finish_arena_duel(duel_id, winner_uuid=None, loser_uuid=None, leaver_uuid=No
     stats_mgr.save_data()
 
     eco = get_economy_manager()
-    if eco and bet > 0:
-        # ФИКС дублирования денег: раньше deposit() победителю выполнялся
-        # БЕЗУСЛОВНО, даже если withdraw() у проигравшего вернул False
-        # (например баланс проигравшего уже < ставки на момент завершения
-        # дуэли — деньги успели потратить/забрать за время боя). Теперь
-        # деньги переводятся победителю ТОЛЬКО если списание реально прошло.
-        withdrawn_ok = eco.withdraw(loser_uuid, bet)
-        if withdrawn_ok:
-            eco.deposit(winner_uuid, bet, winner_name)
+    escrow_total = float(duel.get("escrow_total", 0.0))
+    if bet > 0 and escrow_total > 0:
+        data_mgr = ArenaDataManager()
+        settlement = {"duel_id": duel_id, "winner_uuid": winner_uuid, "winner_name": winner_name,
+                      "kind": "PAYOUT", "amount": escrow_total, "status": "PREPARED", "time": time.time()}
+        data_mgr.pending_settlements[duel_id] = settlement
+        if not data_mgr.save_data():
+            settlement["status"] = "STORAGE_ERROR"
+            log_error(u"Arena payout {0} was held because settlement intent was not persisted.".format(duel_id))
+            eco = None
+        if economy_deposit_checked(eco, winner_uuid, escrow_total, winner_name):
+            settlement["status"] = "PAID"
+            duel["settled"] = True
+            data_mgr.pending_settlements.pop(duel_id, None)
         else:
-            log_error(u"Arena duel {0}: withdraw failed for loser {1}, bet {2} NOT paid out to winner (anti-duplication guard)".format(duel_id, loser_uuid, bet))
+            settlement["status"] = "PENDING" if eco is None else "AMBIGUOUS"
+            settlement["error"] = u"Economy unavailable or did not confirm deposit"
+            log_error(u"Arena payout {0} requires administrator review.".format(duel_id))
+        data_mgr.save_data()
+
+    arena_data = ArenaDataManager()
+    arena_data.match_history.append({
+        "duel_id": duel_id, "p1_uuid": p1_uuid, "p1_name": duel.get("p1_name"),
+        "p2_uuid": p2_uuid, "p2_name": duel.get("p2_name"), "winner_uuid": winner_uuid,
+        "loser_uuid": loser_uuid, "technical_loss": bool(leaver_uuid), "bet": bet,
+        "escrow_total": float(duel.get("escrow_total", 0.0)), "elo_delta": elo_delta,
+        "started_at": duel.get("started_at"), "finished_at": time.time()
+    })
+    if len(arena_data.match_history) > ArenaConfig.HISTORY_LIMIT:
+        del arena_data.match_history[:-ArenaConfig.HISTORY_LIMIT]
+    arena_data.save_data()
 
     if BUKKIT_AVAILABLE:
         if w_player and w_player.isOnline():
@@ -1360,6 +1563,30 @@ def on_player_move(event):
             to_loc = event.getTo()
             if from_loc.getX() != to_loc.getX() or from_loc.getY() != to_loc.getY() or from_loc.getZ() != to_loc.getZ():
                 event.setCancelled(True)
+            return
+
+        duel_id, duel = get_player_duel(uuid_str)
+        if not duel_id or duel.get("state") != "FIGHT":
+            return
+        to_loc = event.getTo()
+        arena_mgr = ArenaDataManager()
+        p1_loc = arena_mgr.get_spawn_location("p1")
+        p2_loc = arena_mgr.get_spawn_location("p2")
+        if not to_loc or not p1_loc or not p2_loc:
+            return
+        outside = to_loc.getWorld() != p1_loc.getWorld()
+        if not outside:
+            center_x = (p1_loc.getX() + p2_loc.getX()) / 2.0
+            center_y = (p1_loc.getY() + p2_loc.getY()) / 2.0
+            center_z = (p1_loc.getZ() + p2_loc.getZ()) / 2.0
+            dx = to_loc.getX() - center_x
+            dz = to_loc.getZ() - center_z
+            outside = (dx * dx + dz * dz > ArenaConfig.ARENA_RADIUS * ArenaConfig.ARENA_RADIUS or
+                       abs(to_loc.getY() - center_y) > ArenaConfig.ARENA_VERTICAL_LIMIT)
+        if outside:
+            event.setCancelled(True)
+            send_arena_msg(player, u"{prefix}&cВы покинули границы арены и получили техническое поражение.")
+            finish_arena_duel(duel_id, leaver_uuid=uuid_str)
     except:
         pass
 
@@ -1373,6 +1600,19 @@ def on_entity_damage(event):
         victim_uuid = str(entity.getUniqueId())
         duel_id, duel = get_player_duel(victim_uuid)
         if not duel_id:
+            return
+
+        opponent_uuid = duel["p2_uuid"] if victim_uuid == duel["p1_uuid"] else duel["p1_uuid"]
+        if hasattr(event, "getDamager"):
+            damager = event.getDamager()
+            if damager is not None and hasattr(damager, "getShooter"):
+                damager = damager.getShooter()
+            if damager is None or not isinstance(damager, Player) or str(damager.getUniqueId()) != opponent_uuid:
+                event.setCancelled(True)
+                return
+        else:
+            # Environmental damage must not decide a ranked duel.
+            event.setCancelled(True)
             return
 
         if duel.get("state") == "COUNTDOWN":
@@ -1437,6 +1677,15 @@ def on_player_respawn(event):
             schedule_restore_player(player, delay=1, retries=10)
     except:
         pass
+
+
+def on_player_join(event):
+    try:
+        player = event.getPlayer()
+        if str(player.getUniqueId()) in player_states:
+            schedule_restore_player(player, delay=2, retries=20)
+    except Exception as e:
+        log_error(u"Error restoring arena player on join: {0}".format(e))
 
 
 def on_player_quit(event):
@@ -1835,6 +2084,69 @@ def cmd_arena(*args):
         send_arena_msg(sender, u"{prefix}&cВы не находитесь в зоне наблюдения!")
         return True
 
+    elif sub in ["history", "matches"]:
+        data_mgr = ArenaDataManager()
+        own = [m for m in reversed(data_mgr.match_history)
+               if sender_uuid in [m.get("p1_uuid"), m.get("p2_uuid")]][:10]
+        if not own:
+            send_arena_msg(sender, u"{prefix}&7История боёв пуста.")
+            return True
+        send_arena_msg(sender, u"{prefix}&eПоследние бои:")
+        for match in own:
+            result = u"Победа" if match.get("winner_uuid") == sender_uuid else u"Поражение"
+            technical = u" (техническое)" if match.get("technical_loss") else u""
+            send_arena_msg(sender, u"{prefix}" + u"&7{0}: &f{1} vs {2}&7, ставка &a{3}{4}".format(
+                result, match.get("p1_name"), match.get("p2_name"), format_currency(match.get("bet", 0)), technical))
+        return True
+
+    elif sub == "settlements":
+        if not hasattr(sender, "hasPermission") or not sender.hasPermission("arena.admin"):
+            send_arena_msg(sender, u"{prefix}&cНет права arena.admin.")
+            return True
+        pending = ArenaDataManager().pending_settlements
+        send_arena_msg(sender, u"{prefix}" + u"&eНезавершённые выплаты: &f{0}".format(len(pending)))
+        for sid, entry in list(pending.items())[:20]:
+            send_arena_msg(sender, u"{prefix}" + u"&7{0}: {1}, {2}".format(sid, entry.get("status"), format_currency(entry.get("amount", 0))))
+        return True
+
+    elif sub == "settlement" and len(cmd_args) >= 3:
+        if not hasattr(sender, "hasPermission") or not sender.hasPermission("arena.admin"):
+            send_arena_msg(sender, u"{prefix}&cНет права arena.admin.")
+            return True
+        data_mgr = ArenaDataManager()
+        sid, action = cmd_args[1], cmd_args[2].lower()
+        entry = data_mgr.pending_settlements.get(sid)
+        if not entry or action not in ["paid", "refund"]:
+            send_arena_msg(sender, u"{prefix}&cИспользование: /arena settlement <id> <paid|refund>")
+            return True
+        if action == "refund":
+            eco = get_economy_manager()
+            if entry.get("kind") == "REFUND":
+                if not economy_deposit_checked(eco, entry.get("recipient_uuid"), entry.get("amount", 0), entry.get("recipient_name")):
+                    send_arena_msg(sender, u"{prefix}&cВозврат не подтверждён экономикой; запись оставлена в журнале.")
+                    return True
+            else:
+                history_entry = next((m for m in reversed(data_mgr.match_history) if m.get("duel_id") == sid), None)
+                if not history_entry or not eco:
+                    send_arena_msg(sender, u"{prefix}&cНет истории боя или экономика недоступна.")
+                    return True
+                bet = float(history_entry.get("bet", 0))
+                previous = entry.get("refund_results", {})
+                first_ok = bool(previous.get("p1")) or economy_deposit_checked(
+                    eco, history_entry.get("p1_uuid"), bet, history_entry.get("p1_name"))
+                second_ok = bool(previous.get("p2")) or economy_deposit_checked(
+                    eco, history_entry.get("p2_uuid"), bet, history_entry.get("p2_name"))
+                if not first_ok or not second_ok:
+                    entry["status"] = "PARTIAL_REFUND"
+                    entry["refund_results"] = {"p1": first_ok, "p2": second_ok}
+                    data_mgr.save_data()
+                    send_arena_msg(sender, u"{prefix}&cВозврат выполнен частично; запись оставлена для ручной сверки.")
+                    return True
+        data_mgr.pending_settlements.pop(sid, None)
+        data_mgr.save_data()
+        send_arena_msg(sender, u"{prefix}" + u"&aЗапись выплаты закрыта как {0}.".format(action))
+        return True
+
     elif sub in ["reload"]:
         if hasattr(sender, "isOp") and not sender.isOp():
             send_arena_msg(sender, u"{prefix}&cУ вас недостаточно прав!")
@@ -1873,7 +2185,8 @@ def tab_arena(*args):
     cmd_args = get_cmd_args_from_args(args)
 
     if len(cmd_args) <= 1:
-        subcmds = ["request", "accept", "deny", "stats", "profile", "top", "menu", "resetelo", "setspawn", "reload"]
+        subcmds = ["request", "accept", "deny", "stats", "profile", "top", "history", "menu",
+                   "settlements", "settlement", "resetelo", "setspawn", "reload"]
         prefix = cmd_args[0].lower() if len(cmd_args) == 1 else ""
         return build_java_list([s for s in subcmds if s.startswith(prefix)])
 
@@ -2109,6 +2422,7 @@ def on_enable():
             register_event_directly(EntityDamageEvent, on_entity_damage)
             register_event_directly(PlayerDeathEvent, on_player_death)
             register_event_directly(PlayerRespawnEvent, on_player_respawn)
+            register_event_directly(PlayerJoinEvent, on_player_join)
             register_event_directly(PlayerQuitEvent, on_player_quit)
             register_event_directly(InventoryClickEvent, on_inventory_click)
             log_info(u"Arena events (including InventoryClickEvent) registered directly into Bukkit EventMap.")
@@ -2125,6 +2439,11 @@ def on_disable():
     log_info(u"=== Disabling {0} ===".format(ArenaConfig.PLUGIN_NAME))
     unregister_script_listeners()
     unregister_arena_commands()
+    for duel_id in list(active_duels.keys()):
+        try:
+            cancel_arena_duel(duel_id, u"Arena.py перезагружена: бой отменён, ставки возвращены.")
+        except Exception as e:
+            log_error(u"Could not cancel duel {0} on disable: {1}".format(duel_id, e))
     if BUKKIT_AVAILABLE:
         for uuid_str in list(player_states.keys()):
             try:
