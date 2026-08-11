@@ -257,7 +257,7 @@ def reject_json_constant(value):
 # -----------------------------------------------------------------------------
 class EconomyConfig:
     PLUGIN_NAME = u"SmartY-Economy"
-    VERSION = u"3.8.1"
+    VERSION = u"3.8.2"
     PREFIX = u"&a&l[\u042d\u043a\u043e\u043d\u043e\u043c\u0438\u043a\u0430]&r "
 
     DEFAULT_BALANCE = 100.0
@@ -925,9 +925,12 @@ class EconomyManager(object):
                     loaded_names[acc.name.lower()] = str(uuid_str)
             for world_name, percent in (data.get("sleep_defaults", {}) or {}).items():
                 loaded_sleep_defaults[to_unicode(world_name)] = max(1, min(100, int(percent)))
-            raw_operations = data.get("processed_operations", {}) or {}
-            if not isinstance(raw_operations, dict):
-                raise ValueError("processed_operations must be an object")
+            legacy_operations = data.get("processed_batch_operations", {}) or {}
+            current_operations = data.get("processed_operations", {}) or {}
+            if not isinstance(legacy_operations, dict) or not isinstance(current_operations, dict):
+                raise ValueError("processed operations must be objects")
+            raw_operations = dict(legacy_operations)
+            raw_operations.update(current_operations)
             loaded_operations = self._pruned_operations(raw_operations)
         except Exception as exc:
             log_error(u"Economy database validation failed: {0}".format(exc))
@@ -954,6 +957,10 @@ class EconomyManager(object):
             "payday_amount": round(float(self.payday_amount), 2),
             "payday_afk_threshold": round(float(self.payday_afk_threshold), 1),
             "sleep_defaults": {str(wn): int(pct) for wn, pct in self.sleep_defaults.items()},
+            "processed_batch_operations": dict([
+                (operation_id, int(record.get("timestamp", 0)) if isinstance(record, dict) else int(record))
+                for operation_id, record in self.processed_operations.items()
+            ]),
             "processed_operations": dict(self.processed_operations),
             "accounts": {uuid_str: acc.to_dict() for uuid_str, acc in self.accounts.items()}
         }
@@ -1015,7 +1022,7 @@ class EconomyManager(object):
             self._saving = False
             self._lock.release()
 
-    def _get_or_create_in_memory(self, uuid_str, name):
+    def _get_or_create_in_memory(self, uuid_str, name, update_name=True):
         uuid_key = str(uuid_str)
         unicode_name = to_unicode(name)
         acc = self.accounts.get(uuid_key)
@@ -1024,10 +1031,70 @@ class EconomyManager(object):
             acc = Account(uuid_key, unicode_name)
             self.accounts[uuid_key] = acc
         else:
-            acc.update_last_seen(unicode_name)
-        if unicode_name and unicode_name != u"Unknown":
+            if update_name:
+                old_name = to_unicode(acc.name).strip() if acc.name else u""
+                acc.update_last_seen(unicode_name)
+                if old_name and old_name.lower() != unicode_name.lower():
+                    mapped = self.name_to_uuid.get(old_name.lower())
+                    if mapped == uuid_key:
+                        self.name_to_uuid.pop(old_name.lower(), None)
+            else:
+                acc.update_last_seen()
+        if unicode_name and unicode_name != u"Unknown" and (created or update_name):
             self.name_to_uuid[unicode_name.lower()] = uuid_key
         return acc, created
+
+    @staticmethod
+    def _is_placeholder_account_name(name):
+        value = to_unicode(name).strip().lower() if name is not None else u""
+        return value in (u"", u"unknown", u"investor", u"{minecraft_username}")
+
+    def _offline_name_for_uuid(self, uuid_str):
+        if not BUKKIT_AVAILABLE or JavaUUID is None:
+            return None
+        try:
+            offline = Bukkit.getOfflinePlayer(JavaUUID.fromString(str(uuid_str)))
+            if offline is None:
+                return None
+            name = offline.getName()
+            if name and not self._is_placeholder_account_name(name):
+                return to_unicode(name)
+        except Exception:
+            pass
+        return None
+
+    def _name_for_new_credit_account(self, uuid_str, supplied_name=None):
+        resolved = self._offline_name_for_uuid(uuid_str)
+        if resolved:
+            return resolved
+        if supplied_name is not None and not self._is_placeholder_account_name(supplied_name):
+            return to_unicode(supplied_name)
+        return u"Unknown"
+
+    def repair_corrupted_account_names(self):
+        repaired = 0
+        self._lock.acquire()
+        try:
+            for uuid_key, acc in self.accounts.items():
+                if not self._is_placeholder_account_name(acc.name):
+                    continue
+                resolved = self._offline_name_for_uuid(uuid_key)
+                if not resolved:
+                    continue
+                acc.name = resolved
+                acc.last_seen = int(time.time())
+                repaired += 1
+            if repaired:
+                rebuilt = {}
+                for uuid_key, acc in self.accounts.items():
+                    name = to_unicode(acc.name).strip() if acc.name else u""
+                    if name and not self._is_placeholder_account_name(name):
+                        rebuilt[name.lower()] = str(uuid_key)
+                self.name_to_uuid = rebuilt
+                invalidate_baltop_cache()
+        finally:
+            self._lock.release()
+        return repaired
 
     def get_or_create_account(self, uuid_str, name):
         manager = self.current_manager()
@@ -1094,8 +1161,10 @@ class EconomyManager(object):
         uuid_key = str(uuid_str)
         self._lock.acquire()
         try:
-            acc, created = self._get_or_create_in_memory(uuid_key, name if name else u"Unknown")
+            credit_name = self._name_for_new_credit_account(uuid_key, name)
+            acc, created = self._get_or_create_in_memory(uuid_key, credit_name, update_name=False)
             old_balance = acc.balance
+            old_last_seen = acc.last_seen
             new_balance = old_balance + safe
             if new_balance > EconomyConfig.MAX_BALANCE:
                 if created:
@@ -1104,6 +1173,7 @@ class EconomyManager(object):
             acc.balance = round(new_balance, 2)
             if not self.save_database():
                 acc.balance = old_balance
+                acc.last_seen = old_last_seen
                 if created:
                     self.accounts.pop(uuid_key, None)
                 return False, old_balance
@@ -1155,7 +1225,7 @@ class EconomyManager(object):
         ])
         operation_digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
         changed_uuids = []
-        old_balances = {}
+        old_accounts = {}
         created_uuids = []
 
         self._lock.acquire()
@@ -1174,15 +1244,15 @@ class EconomyManager(object):
                 amount = float(entry[0]) / 100.0
                 acc = self.accounts.get(uuid_key)
                 if acc is None:
-                    account_name = entry[1]
-                    if account_name.lower() in (u"investor", u"unknown"):
-                        account_name = u"Unknown"
+                    account_name = self._name_for_new_credit_account(uuid_key, entry[1])
                     acc = Account(uuid_key, account_name, balance=0.0)
                     self.accounts[uuid_key] = acc
                     created_uuids.append(uuid_key)
                     if acc.name and acc.name != u"Unknown":
                         self.name_to_uuid[acc.name.lower()] = uuid_key
-                old_balances[uuid_key] = acc.balance
+                elif uuid_key not in old_accounts:
+                    old_accounts[uuid_key] = (acc.balance, acc.last_seen)
+                    acc.update_last_seen()
                 if acc.balance + amount > EconomyConfig.MAX_BALANCE:
                     raise ValueError("recipient balance limit exceeded")
                 acc.balance = round(acc.balance + amount, 2)
@@ -1197,9 +1267,10 @@ class EconomyManager(object):
             if not self.save_database():
                 raise IOError("economy database save failed")
         except Exception as exc:
-            for uuid_key, old_balance in old_balances.items():
+            for uuid_key, old_values in old_accounts.items():
                 if uuid_key in self.accounts:
-                    self.accounts[uuid_key].balance = old_balance
+                    self.accounts[uuid_key].balance = old_values[0]
+                    self.accounts[uuid_key].last_seen = old_values[1]
             for uuid_key in created_uuids:
                 self.accounts.pop(uuid_key, None)
             if 'old_name_to_uuid' in locals():
@@ -1255,7 +1326,8 @@ class EconomyManager(object):
             source = self.accounts.get(from_key)
             if source is None or source.balance < safe:
                 return False, self.get_balance(from_key), self.get_balance(to_key)
-            target, created = self._get_or_create_in_memory(to_key, to_name if to_name else u"Unknown")
+            target_name = self._name_for_new_credit_account(to_key, to_name)
+            target, created = self._get_or_create_in_memory(to_key, target_name, update_name=False)
             if target.balance + safe > EconomyConfig.MAX_BALANCE:
                 if created:
                     self.accounts.pop(to_key, None)
@@ -1287,7 +1359,8 @@ class EconomyManager(object):
         uuid_key = str(uuid_str)
         self._lock.acquire()
         try:
-            acc, created = self._get_or_create_in_memory(uuid_key, name if name else u"Unknown")
+            account_name = self._name_for_new_credit_account(uuid_key, name)
+            acc, created = self._get_or_create_in_memory(uuid_key, account_name, update_name=False)
             old_balance = acc.balance
             acc.balance = round(safe, 2)
             if not self.save_database():
@@ -1496,10 +1569,28 @@ def broadcast_plain(message):
     safe_console_send(line)
 
 
+HIDDEN_SESSIONS_PROPERTY = u"SmartY_Hidden_ActiveSessions"
+
+
+def is_hidden_admin(player):
+    """True only while /hidden is active in this exact online session."""
+    if player is None or not JAVA_STRING_AVAILABLE or System is None:
+        return False
+    try:
+        sessions = System.getProperties().get(HIDDEN_SESSIONS_PROPERTY)
+        if sessions is None:
+            return False
+        return str(player.getUniqueId()) in sessions
+    except Exception:
+        return False
+
+
 def is_player_afk(player):
     if player is None:
         return False
     try:
+        if is_hidden_admin(player):
+            return False
         return bool(afk_players.get(str(player.getUniqueId()), False))
     except Exception:
         return False
@@ -1635,8 +1726,13 @@ def set_player_afk(player, value, automatic=False):
         uuid_str, name = get_sender_uuid_and_name(player)
         if not uuid_str:
             return False
-        current = bool(afk_players.get(uuid_str, False))
         value = bool(value)
+        if value and is_hidden_admin(player):
+            afk_players.pop(uuid_str, None)
+            last_activity[uuid_str] = time.time()
+            last_location_keys[uuid_str] = get_location_key(player.getLocation())
+            return False
+        current = bool(afk_players.get(uuid_str, False))
         if current == value:
             return False
 
@@ -1693,6 +1789,11 @@ class AfkRunnable(Runnable):
                     continue
                 uuid_str, name = get_sender_uuid_and_name(player)
                 if not uuid_str:
+                    continue
+                if is_hidden_admin(player):
+                    afk_players.pop(uuid_str, None)
+                    last_activity[uuid_str] = now
+                    last_location_keys[uuid_str] = get_location_key(player.getLocation())
                     continue
                 if uuid_str not in last_activity:
                     last_activity[uuid_str] = now
@@ -1936,6 +2037,9 @@ def _is_recently_active(uuid_str, now, threshold=None):
             threshold = float(EconomyManager().payday_afk_threshold)
         except Exception:
             threshold = float(EconomyConfig.DEFAULT_PAYDAY_INACTIVITY)
+    hidden_player = get_online_player_by_uuid(uuid_str)
+    if hidden_player is not None and is_hidden_admin(hidden_player):
+        return True
     la = last_activity.get(uuid_str)
     if la is None:
         return False
@@ -3250,6 +3354,9 @@ def on_enable():
             except Exception:
                 pass
         economy._active = True
+        repaired_names = economy.repair_corrupted_account_names()
+        if repaired_names:
+            log_info(u"Repaired {0} corrupted economy account name(s) from Bukkit UUID data.".format(repaired_names))
         # Creates the first file when the database does not exist and upgrades
         # the on-disk format only after this manager becomes authoritative.
         if not economy.save_database():

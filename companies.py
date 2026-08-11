@@ -327,15 +327,15 @@ def get_pyspigot_plugin():
 
 class CompaniesConfig(object):
     PLUGIN_NAME = u"SmartY-Companies"
-    VERSION = u"1.3.1"
+    VERSION = u"1.3.2"
     PREFIX = u"&3&l[Предприятия]&r "
     SHARES_TOTAL = 10000
     MAX_OWNER_COMPANIES = 10
     MIN_SHARE_PRICE = 10.0
     MAX_START_SHARE_PRICE = 100000.0
     DEFAULT_TAX_PERCENT = 2.0
-    # Test mode: switch this to 86400 for one payout per day.
-    DIVIDEND_INTERVAL_SECONDS = 300
+    # Production: dividend cycle matches the currently deployed server file.
+    DIVIDEND_INTERVAL_SECONDS = 3 * 60 * 60
     DIVIDEND_SCHEDULE_VERSION = DIVIDEND_INTERVAL_SECONDS
     DIVIDEND_TASK_INITIAL_DELAY_TICKS = 20
     DIVIDEND_TASK_PERIOD_TICKS = 100
@@ -1630,7 +1630,7 @@ class CompanyService(object):
         company["updated_at"] = int(time.time())
         if not self.save_company_change(player, company, snapshot, "set dividends"):
             return
-        send_message(player, CompaniesConfig.PREFIX + u"&aДивиденды &b{0}&a: &e{1}&a каждые 5 минут (тестовый режим).".format(company.get("name"), format_currency(amount)))
+        send_message(player, CompaniesConfig.PREFIX + u"&aДивиденды &b{0}&a: &e{1}&a каждые 3 часа.".format(company.get("name"), format_currency(amount)))
 
     def rename(self, player, company_name, new_name):
         company = self.require_owner(player, company_name)
